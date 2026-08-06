@@ -598,6 +598,7 @@ const DESTRUCTIVE_BACKUP_REASONS = new Set([
     'reroll',
     'delete-message',
     'delete-swipe',
+    'script-bulk-chat',
 ]);
 
 function isDestructiveBackupReason(reason) {

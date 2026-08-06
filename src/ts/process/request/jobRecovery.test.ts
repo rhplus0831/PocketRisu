@@ -774,7 +774,7 @@ describe('attachRunningJob', () => {
         expect(genState.isChatGenerating('chat-1')).toBe(true)
         expect(get(genState.generationStates).get('chat-1')?.kind).toBe('background')
         expect(get(genState.doingChat)).toBe(false) // must not lock the global send UI
-        genState.endAllGenerations() // DevTool/multisend cleanup writes
+        genState.endAllGenerations() // intentional global administrative reset
         expect(genState.isChatGenerating('chat-1')).toBe(true) // guard survives
         status.stopStatusTimer()
     })

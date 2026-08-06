@@ -148,6 +148,62 @@ describe('pending chat backup reasons', () => {
             'delete-swipe',
         )
     })
+
+    test('does not let an ordinary edit overwrite a pending destructive reason', async () => {
+        const chat = blankChat({ id: 'priority-chat' })
+        setChatBackupReason('char-priority', chat.id, 'script-bulk-chat')
+        setChatBackupReason('char-priority', chat.id, 'edit-message')
+
+        await saveChatToServer('char-priority', 0, chat.id, chat)
+
+        expect(mockSaveChatContent).toHaveBeenCalledWith(
+            'char-priority',
+            0,
+            chat.id,
+            chat,
+            'script-bulk-chat',
+        )
+    })
+
+    test('coalesces ordinary work into an in-flight destructive save', async () => {
+        const chat = blankChat({ id: 'destructive-flight-chat' })
+        let finishSave: (() => void) | undefined
+        mockSaveChatContent.mockImplementationOnce(() => new Promise<void>(resolve => {
+            finishSave = resolve
+        }))
+        setChatBackupReason('char-flight-priority', chat.id, 'script-bulk-chat')
+
+        const firstSave = saveChatToServer('char-flight-priority', 0, chat.id, chat)
+        setChatBackupReason('char-flight-priority', chat.id, 'edit-message')
+        finishSave?.()
+        await firstSave
+        await saveChatToServer('char-flight-priority', 0, chat.id, chat)
+
+        expect(mockSaveChatContent.mock.calls.map(call => call[4])).toEqual([
+            'script-bulk-chat',
+            undefined,
+        ])
+    })
+
+    test('retains destructive work queued during an ordinary in-flight save', async () => {
+        const chat = blankChat({ id: 'ordinary-flight-chat' })
+        let finishSave: (() => void) | undefined
+        mockSaveChatContent.mockImplementationOnce(() => new Promise<void>(resolve => {
+            finishSave = resolve
+        }))
+        setChatBackupReason('char-flight-upgrade', chat.id, 'edit-message')
+
+        const firstSave = saveChatToServer('char-flight-upgrade', 0, chat.id, chat)
+        setChatBackupReason('char-flight-upgrade', chat.id, 'script-bulk-chat')
+        finishSave?.()
+        await firstSave
+        await saveChatToServer('char-flight-upgrade', 0, chat.id, chat)
+
+        expect(mockSaveChatContent.mock.calls.map(call => call[4])).toEqual([
+            'edit-message',
+            'script-bulk-chat',
+        ])
+    })
 })
 
 describe('chat backup import transformation', () => {

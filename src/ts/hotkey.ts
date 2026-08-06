@@ -7,7 +7,7 @@ import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
 import { doingChat, previewBody, sendChat } from "./process/index.svelte"
 import { chatOperationActive } from './process/chatSendState'
-import { endAllGenerations } from "./process/generationState"
+import { chatGenKey, runScopedGeneration } from "./process/generationState"
 import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
 import { openSettings, SettingsRoute, SystemTab } from "./routing"
 
@@ -136,10 +136,13 @@ export function initHotkey(){
                     alertWait("Loading...")
                     ev.preventDefault()
                     ev.stopPropagation()
+                    const selectedCharacter = database.characters[get(selectedCharID)]
+                    const generationKey = chatGenKey(
+                        selectedCharacter?.chats?.[selectedCharacter.chatPage]?.id,
+                    )
                     try {
-                        await sendChat(-1, {
-                            previewPrompt: true
-                        })
+                        await runScopedGeneration(generationKey, () =>
+                            sendChat(-1, { previewPrompt: true }))
 
                         let md = ''
                         md += '### Prompt\n'
@@ -152,10 +155,6 @@ export function initHotkey(){
                         // user trapped in it until a reload.
                         alertClear()
                         throw error
-                    } finally {
-                        // Without this a throw from sendChat/JSON.parse left the
-                        // generation state locked.
-                        endAllGenerations()
                     }
                     return
                 }

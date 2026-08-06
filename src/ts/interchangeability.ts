@@ -16,7 +16,8 @@ export function convertModuleToCharacter(m: RisuModule): character {
     char.globalLore = safeStructuredClone(m.lorebook || [])
     char.customscript = m.regex || []
     char.triggerscript = m.trigger || []
-    char.lowLevelAccess = m.lowLevelAccess || false
+    char.lowLevelAccess = m.lowLevelAccess === true
+    char.destructiveAccess = m.destructiveAccess === true
     char.hideChatIcon = m.hideIcon || false
     char.backgroundHTML = m.backgroundEmbedding || ""
     char.additionalAssets = m.assets || []
@@ -59,6 +60,7 @@ export function convertCharacterToModule(c: character): RisuModule {
         regex: c.customscript,
         trigger: c.triggerscript,
         lowLevelAccess: c.lowLevelAccess,
+        destructiveAccess: c.destructiveAccess,
         hideIcon: c.hideChatIcon,
         backgroundEmbedding: c.backgroundHTML,
         assets: c.additionalAssets,

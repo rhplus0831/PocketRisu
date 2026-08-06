@@ -2,6 +2,7 @@ import type { Chat } from '../../storage/database.svelte'
 import { throwIfAborted } from '../../storage/abort'
 import type { ChatSendTarget } from '../../process/chatSendTarget'
 import type { ChatSendTransaction } from '../../process/chatSendState'
+import { runScopedGeneration } from '../../process/generationState'
 
 type InputHook = (content: string) => string | null | undefined | Promise<string | null | undefined>
 
@@ -17,7 +18,6 @@ export interface PluginChatSendDependencies {
         transaction: ChatSendTransaction | null,
         signal?: AbortSignal,
     ) => Promise<unknown>
-    releaseGeneration: () => void
     now?: () => number
 }
 
@@ -81,11 +81,8 @@ export function createPluginChatSendController(
             })
         }
 
-        try {
-            await dependencies.runGeneration(target, transaction, signal)
-        } finally {
-            dependencies.releaseGeneration()
-        }
+        await runScopedGeneration(target.chatId, () =>
+            dependencies.runGeneration(target, transaction, signal))
         return true
     }
 

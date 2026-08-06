@@ -392,8 +392,34 @@ then fsyncs and renames it atomically. Ordinary captures are best-effort and
 have a 45-second per-chat cooldown. The cooldown applies only to non-negative elapsed
 wall-clock time; a backward clock adjustment permits one capture, which establishes the
 new in-process cooldown baseline while version filenames retain wall-clock timestamps.
-Explicit edit, delete-message, and reroll actions
-attach a sanitized reason for display; small cold-storage placeholder rows are skipped
+Explicit edit, delete-message, reroll, and script-driven bulk-chat actions attach a
+sanitized reason for display. `reroll`, `delete-message`, `delete-swipe`, and
+`script-bulk-chat` are destructive overwrite reasons: full and delta chat writes force a
+cooldown-exempt required pre-image, and capture failure rejects the write with definitive
+`CHAT_PREIMAGE_CAPTURE_FAILED` before the row mutates. The client queues
+`script-bulk-chat` only when a destructive trigger result is actually published to its
+durable chat target. Lua edit and button hooks mutate an isolated chat clone; publication
+queues the reason synchronously immediately before replacing the stable-ID target, after
+all hook awaits have completed. Publication is rejected before queuing the reason when
+the captured source object or its pre-hook state no longer matches the durable row,
+including same-ID replacement and in-place concurrent edits. A stale or disappeared
+target is neither replaced nor marked.
+
+Trigger-owned `scriptstate`, author-note, metadata, and message changes remain isolated on
+the trigger clone until this publication boundary, preventing the guard from rejecting a
+trigger's own variable/output writes. Intermediate multisend child turns return a refreshed
+source guard for their intentional durable transition.
+
+Input, manual, start, streaming-output, and non-streaming-output publishers all capture
+the guard before trigger execution and consume the returned-or-initial guard at durable
+publication. Recursive triggers, nested slash `/trigger`, and command pipelines carry the
+same guard forward. Stale intermediate multisend publication is rejected before its
+destructive reason callback and nested send; only a successful owned transition refreshes
+the guard.
+
+Pending destructive reasons outrank ordinary edit reasons and keep
+their identity through the matching save acknowledgement, so a later reactive edit
+cannot silently downgrade required capture. Small cold-storage placeholder rows are skipped
 using the rebuildable per-row derivative, with a bounded legacy decode fallback when that
 metadata is absent.
 

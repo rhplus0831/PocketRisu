@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **24 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **23 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -73,7 +73,6 @@ Current catalog: **24 open**, **0 deferred**, and **5 accepted decisions**.
 | ID | Finding | Status | Source |
 |---|---|---|---|
 | `FND-callback-bridge-skips-stream-transfer-and-remote-class-serialization` | [Callback bridge skips deep stream transfer and remote-class serialization](open/scripting-extensions/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) | Open | 2026-07 data-loss audit |
-| `FND-card-triggers-can-bulk-delete-history-without-consent` | [Imported card triggers can bulk-delete chat history without the low-level-access consent](open/scripting-extensions/card-triggers-can-bulk-delete-history-without-consent.md) | Open | 2026-07 data-loss audit |
 | `FND-lua-local-lore-upsert-is-discarded` | [Lua local-lore upserts are discarded in non-display trigger modes](open/scripting-extensions/lua-local-lore-upsert-is-discarded.md) | Open | delta audit DA-10 |
 
 ### server backend

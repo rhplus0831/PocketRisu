@@ -8,7 +8,7 @@ import { selectSingleFile } from "../util";
 import { assetRegex, type CbsConditions, risuChatParser as risuChatParserOrg, type simpleCharacterArgument } from "../parser/parser.svelte";
 import { getModuleAssets, getModuleRegexScripts } from "./modules";
 import { HypaProcesser } from "./memory/hypamemory";
-import { runLuaEditTrigger } from "./scriptings";
+import { runLuaEditTrigger, type ScriptChatExecutionTarget } from "./scriptings";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { runTrigger } from "./triggers";
 import { applyPluginEditHandlers } from './pluginEditHandlers';
@@ -24,8 +24,14 @@ type pScript = {
     actions: string[]
 }
 
-export async function processScript(char:character, data:string, mode:ScriptMode, cbsConditions:CbsConditions = {}){
-    return (await processScriptFull(char, data, mode, -1, cbsConditions)).data
+export async function processScript(
+    char:character,
+    data:string,
+    mode:ScriptMode,
+    cbsConditions:CbsConditions = {},
+    target?:ScriptChatExecutionTarget,
+){
+    return (await processScriptFull(char, data, mode, -1, cbsConditions, target)).data
 }
 
 export function exportRegex(s?:customscript[]){
@@ -97,10 +103,17 @@ export function resetScriptCache(){
     processScriptCache = new Map()
 }
 
-export async function processScriptFull(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}){
+export async function processScriptFull(
+    char:character|simpleCharacterArgument,
+    data:string,
+    mode:ScriptMode,
+    chatID = -1,
+    cbsConditions:CbsConditions = {},
+    target?:ScriptChatExecutionTarget,
+){
     let db = getDatabase()
     let emoChanged = false
-    data = await runLuaEditTrigger(char, mode, data, { index:chatID })
+    data = await runLuaEditTrigger(char, mode, data, { index:chatID }, target)
 
     if(mode === 'editdisplay'){
         const currentChar = getCurrentCharacter()

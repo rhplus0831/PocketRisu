@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, normalizeChat, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
+import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, type Message, normalizeChat, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -27,13 +27,25 @@ import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
-import { resolveChatSendTarget, type ChatSendTarget } from './chatSendTarget';
+import { captureChatPublicationGuard, publishTriggerChatToTarget, resolveChatExecutionTarget, resolveChatSendTarget, type ChatSendTarget } from './chatSendTarget';
 import {
     getActiveChatSendTransaction,
     type ChatSendTransaction,
 } from './chatSendState';
-import { chatGenKey, chatProcessStage, endGeneration, isChatGenerating, setGenerationStage, startGeneration } from "./generationState";
+import {
+    cancelGenerationHandoff,
+    chatGenKey,
+    chatProcessStage,
+    endGenerationIfOwned,
+    handoffGenerationIfOwned,
+    isChatGenerating,
+    setGenerationStage,
+    startGeneration,
+    type GenerationHandoff,
+} from "./generationState";
 import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
+import { setChatBackupReason } from "../storage/chatStorage";
+import { SCRIPT_BULK_CHAT_BACKUP_REASON } from "./scriptCapabilities";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -75,10 +87,18 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     target?:ChatSendTarget
     /** Authorizes generation while the matching outer UI send is in input processing. */
     transaction?:ChatSendTransaction
+    /** Scoped ownership/controller transfer for auto-continue or resend. */
+    generationHandoff?:GenerationHandoff
 } = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
+    const rejectBeforeGenerationRegistration = () => {
+        if(arg.generationHandoff){
+            cancelGenerationHandoff(arg.generationHandoff)
+        }
+        return false
+    }
     
     // NOTE: `throwError()` can be called before these are populated (e.g. HypaV3 early validation errors).
     // Keep them declared up-front to avoid TDZ ReferenceErrors in production builds.
@@ -184,12 +204,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     const activeTransaction = getActiveChatSendTransaction()
     if((activeTransaction && arg.transaction !== activeTransaction)
         || (!activeTransaction && arg.transaction)){
-        return false
+        return rejectBeforeGenerationRegistration()
     }
     if(activeTransaction && arg.target
         && (arg.target.chaId !== activeTransaction.target.chaId
             || arg.target.chatId !== activeTransaction.target.chatId)){
-        return false
+        return rejectBeforeGenerationRegistration()
     }
     const target = arg.target ?? activeTransaction?.target
 
@@ -197,19 +217,24 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // already generating. Keyed by the real chat id (chat.id); legacy chats
     // without an id share one fallback key. See generationState.ts.
     const guardTarget = target ? resolveChatSendTarget(DBState.db, target) : null
-    if (target && !guardTarget) return false
+    if (target && !guardTarget) return rejectBeforeGenerationRegistration()
     const guardChar = guardTarget?.character ?? DBState.db.characters[get(selectedCharID)]
     const guardChatIndex = guardTarget?.chatIndex ?? guardChar?.chatPage
     const realChatId = guardChar?.chats?.[guardChatIndex]?.id
     const genKey = chatGenKey(realChatId)
 
     if(isChatGenerating(genKey)){
-        if(chatProcessIndex === -1){
-            return false
+        if(arg.generationHandoff || chatProcessIndex === -1){
+            return rejectBeforeGenerationRegistration()
         }
     }
     const generationId = v4()
-    startGeneration(genKey, generationId)
+    const generationOwnership = arg.generationHandoff
+        ? startGeneration(genKey, generationId, 'live', arg.generationHandoff)
+        : startGeneration(genKey, generationId)
+    if(!generationOwnership){
+        return rejectBeforeGenerationRegistration()
+    }
     // Resumable-send tombstone (pendingSends.ts): registered BEFORE the
     // pipeline so a tab death anywhere in it (translate → memory → request)
     // leaves the marker; cleared on every conclude path. Previews never
@@ -240,8 +265,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(target){
         const resolvedTarget = resolveChatSendTarget(DBState.db, target)
         if(!resolvedTarget){
-            endGeneration(genKey)
-            if (realChatId) clearPendingSend(realChatId)
+            if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
+                clearPendingSend(realChatId)
+            }
             return false
         }
         selectedChar = resolvedTarget.characterIndex
@@ -258,8 +284,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[selectedChat]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        endGeneration(genKey)
-        if (realChatId) clearPendingSend(realChatId)
+        if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
+            clearPendingSend(realChatId)
+        }
         return false
     }
     nowChatroom.chats[selectedChat].message = nowChatroom.chats[selectedChat].message.map((v) => {
@@ -307,6 +334,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     const tokenizer = new ChatTokenizer(chatAdditonalTokens, DBState.db.aiModel.startsWith('gpt') ? 'noName' : 'name')
     let currentChat = runCurrentChatFunction(nowChatroom.chats[selectedChat])
     nowChatroom.chats[selectedChat] = currentChat
+    const operationTarget: ChatSendTarget | null = currentChat.id
+        ? { chaId: nowChatroom.chaId, chatId: currentChat.id }
+        : null
+    const getScriptExecutionTarget = () => operationTarget
+        ? resolveChatExecutionTarget(DBState.db, operationTarget) ?? undefined
+        : undefined
     let maxContextTokens = DBState.db.maxContext
     // Output-token reservation for the context budget. Defaults to the legacy
     // global db.maxResponse (the "[채팅 봇]" max response size), overridden below
@@ -865,15 +898,42 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentTokens += await tokenizer.tokenizeChat(chat)
     }
     
-    const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat})
+    const startTriggerGuard = captureChatPublicationGuard(currentChat)
+    const triggerResult = await runTrigger(currentChar, 'start', {
+        chat: currentChat,
+        chatPublicationGuard: startTriggerGuard,
+    })
     if(triggerResult){
-        currentChat = triggerResult.chat
-        setCurrentChat(currentChat)
+        const publishedTarget = operationTarget
+            ? publishTriggerChatToTarget(
+                DBState.db,
+                operationTarget,
+                triggerResult,
+                ({ chaId, chatId }) => setChatBackupReason(
+                    chaId,
+                    chatId,
+                    SCRIPT_BULK_CHAT_BACKUP_REASON,
+                ),
+                triggerResult.chatPublicationGuard ?? startTriggerGuard,
+            )
+            : null
+        if(!publishedTarget){
+            if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
+                clearPendingSend(realChatId)
+            }
+            return false
+        }
+        selectedChar = publishedTarget.characterIndex
+        selectedChat = publishedTarget.chatIndex
+        nowChatroom = publishedTarget.character
+        currentChar = nowChatroom
+        currentChat = publishedTarget.chat
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            endGeneration(genKey)
-            if (realChatId) clearPendingSend(realChatId)
+            if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
+                clearPendingSend(realChatId)
+            }
             return false
         }
     }
@@ -1411,10 +1471,22 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         })
     }
 
-    formated = await runLuaEditTrigger(currentChar, 'editRequest', formated)
+    formated = await runLuaEditTrigger(
+        currentChar,
+        'editRequest',
+        formated,
+        undefined,
+        getScriptExecutionTarget(),
+    )
 
     if(DBState.db.promptInfoInsideChat && DBState.db.promptTextInfoInsideChat){
-        promptBodyformatedForChatStore = await runLuaEditTrigger(currentChar, 'editRequest', promptBodyformatedForChatStore)
+        promptBodyformatedForChatStore = await runLuaEditTrigger(
+            currentChar,
+            'editRequest',
+            promptBodyformatedForChatStore,
+            undefined,
+            getScriptExecutionTarget(),
+        )
         promptInfo.promptText = promptBodyformatedForChatStore
     }
 
@@ -1590,7 +1662,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         DBState.db.characters[selectedChar].reloadKeys += 1
                         continue
                     }
-                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + nextResult), 'editoutput', msgIndex)
+                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + nextResult), 'editoutput', msgIndex, {}, getScriptExecutionTarget())
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
                     emoChanged = result2.emoChanged
                     DBState.db.characters[selectedChar].reloadKeys += 1
@@ -1649,7 +1721,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         scheduleStreamingDisplayFlush()
                     }
                     else{
-                        let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                        let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex, {}, getScriptExecutionTarget())
                         DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
                         emoChanged = result2.emoChanged
                         DBState.db.characters[selectedChar].reloadKeys += 1
@@ -1675,7 +1747,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     throw streamingFlushError
                 }
                 if(deferStreamingPostProcessing && receivedStreamingResult){
-                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex, {}, getScriptExecutionTarget())
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
                     emoChanged = result2.emoChanged
                 }
@@ -1695,9 +1767,34 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
         DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
-        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
+        const outputTriggerGuard = captureChatPublicationGuard(currentChat)
+        const triggerResult = await runTrigger(currentChar, 'output', {
+            chat: currentChat,
+            chatPublicationGuard: outputTriggerGuard,
+        })
         if(triggerResult && triggerResult.chat){
-            currentChat = normalizeChat(triggerResult.chat)
+            const publishedTarget = operationTarget
+                ? publishTriggerChatToTarget(
+                    DBState.db,
+                    operationTarget,
+                    { ...triggerResult, chat: normalizeChat(triggerResult.chat) },
+                    ({ chaId, chatId }) => setChatBackupReason(
+                        chaId,
+                        chatId,
+                        SCRIPT_BULK_CHAT_BACKUP_REASON,
+                    ),
+                    triggerResult.chatPublicationGuard ?? outputTriggerGuard,
+                )
+                : null
+            if(!publishedTarget){
+                if (realChatId) clearPendingSend(realChatId)
+                return false
+            }
+            selectedChar = publishedTarget.characterIndex
+            selectedChat = publishedTarget.chatIndex
+            nowChatroom = publishedTarget.character
+            currentChar = nowChatroom
+            currentChat = publishedTarget.chat
         }
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
@@ -1723,11 +1820,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             let msg = msgs[i]
             let mess = msg[1]
             let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
-            let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
+            let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex, {}, getScriptExecutionTarget())
             if(i === 0 && arg.continue){
                 msgIndex -= 1
                 let beforeChat = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
-                result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex)
+                result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex, {}, getScriptExecutionTarget())
             }
             if(DBState.db.removeIncompleteResponse){
                 result2.data = trimUntilPunctuation(result2.data)
@@ -1782,9 +1879,35 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
 
-        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
+        const outputTriggerGuard = captureChatPublicationGuard(currentChat)
+        const triggerResult = await runTrigger(currentChar, 'output', {
+            chat: currentChat,
+            chatPublicationGuard: outputTriggerGuard,
+        })
         if(triggerResult && triggerResult.chat){
-            DBState.db.characters[selectedChar].chats[selectedChat] = normalizeChat(triggerResult.chat)
+            const triggeredChat = normalizeChat(triggerResult.chat)
+            const publishedTarget = operationTarget
+                ? publishTriggerChatToTarget(
+                    DBState.db,
+                    operationTarget,
+                    { ...triggerResult, chat: triggeredChat },
+                    ({ chaId, chatId }) => setChatBackupReason(
+                        chaId,
+                        chatId,
+                        SCRIPT_BULK_CHAT_BACKUP_REASON,
+                    ),
+                    triggerResult.chatPublicationGuard ?? outputTriggerGuard,
+                )
+                : null
+            if(!publishedTarget){
+                if (realChatId) clearPendingSend(realChatId)
+                return false
+            }
+            selectedChar = publishedTarget.characterIndex
+            selectedChat = publishedTarget.chatIndex
+            nowChatroom = publishedTarget.character
+            currentChar = nowChatroom
+            currentChat = publishedTarget.chat
         }
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
@@ -1803,7 +1926,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     if(needsAutoContinue){
-        endGeneration(genKey, { keepPendingAbort: true })
+        const generationHandoff = handoffGenerationIfOwned(genKey, generationOwnership)
+        if(!generationHandoff) return false
         return await sendChat(chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
@@ -1811,6 +1935,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             usedContinueTokens: resultTokens,
             target,
             transaction: activeTransaction ?? undefined,
+            generationHandoff,
         })
     }
 
@@ -1849,11 +1974,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
         }
         
-        endGeneration(genKey, { keepPendingAbort: true })
+        const generationHandoff = handoffGenerationIfOwned(genKey, generationOwnership)
+        if(!generationHandoff) return false
         return await sendChat(chatProcessIndex, {
             signal: abortSignal,
             target,
             transaction: activeTransaction ?? undefined,
+            generationHandoff,
         })
     }
 

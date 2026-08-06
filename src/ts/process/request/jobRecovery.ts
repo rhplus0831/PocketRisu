@@ -6,7 +6,7 @@ import { notifyError, notifyInfo } from 'src/ts/alert'
 import { addLog } from 'src/ts/log'
 import { recordRequestLog } from 'src/ts/requestLog'
 import { language } from 'src/lang'
-import { chatGenKey, endGeneration, generationStates, registerAbort, startGeneration } from 'src/ts/process/generationState'
+import { chatGenKey, endGenerationIfOwned, generationStates, registerAbort, startGeneration, type GenerationOwnershipToken } from 'src/ts/process/generationState'
 import { clearStatus, endStatus, startStatus } from 'src/ts/status/requestStatus'
 import { authHeader } from './jobFetch'
 import { clearPendingSend, listPendingSends, markResumable, resumableSends, type PendingSendRecord } from './pendingSends'
@@ -509,12 +509,17 @@ export function attachRunningJob(job: ModelJobRecord): void {
     // global doingChat (which would lock every send UI for up to the poll
     // deadline). Survives endAllGenerations cleanup writes for the same reason.
     let controller: AbortController | undefined
-    if (!get(generationStates).has(genKey)) {
-        startGeneration(genKey, registeredGenId, 'background')
+    const existingGeneration = get(generationStates).get(genKey)
+    let generationOwnership: GenerationOwnershipToken | undefined
+    if (!existingGeneration) {
+        generationOwnership = startGeneration(genKey, registeredGenId, 'background')
         // Wire the Stop button: aborting DELETEs the job (server aborts the
         // upstream), stops the poll loop, and releases guard + status.
         controller = new AbortController()
         registerAbort(genKey, controller)
+    } else if(existingGeneration.kind === 'background'
+        && existingGeneration.generationId === registeredGenId){
+        generationOwnership = existingGeneration.ownership
     }
     const statusId = statusEnabled() && job.generationId ? job.generationId : undefined
     if (statusId) {
@@ -526,14 +531,14 @@ export function attachRunningJob(job: ModelJobRecord): void {
             now: Date.now(),
         }))
     }
-    void pollRunningJob(job, genKey, registeredGenId, statusId, controller?.signal)
+    void pollRunningJob(job, genKey, generationOwnership, statusId, controller?.signal)
         .finally(() => attachedJobs.delete(job.id))
 }
 
 async function pollRunningJob(
     job: ModelJobRecord,
     genKey: string,
-    registeredGenId: string,
+    generationOwnership: GenerationOwnershipToken | undefined,
     statusId: string | undefined,
     abortSignal?: AbortSignal,
 ): Promise<void> {
@@ -542,8 +547,8 @@ async function pollRunningJob(
     const finish = (outcome: 'done' | 'failed' | 'aborted', error?: string) => {
         // Only release the guard if it is still OUR registration (a completed
         // recovery must not end a generation the user started afterwards).
-        if (get(generationStates).get(genKey)?.generationId === registeredGenId) {
-            endGeneration(genKey)
+        if (generationOwnership) {
+            endGenerationIfOwned(genKey, generationOwnership)
         }
         if (statusId) {
             safeStatus(() => endStatus(statusId, outcome, { now: Date.now(), error }))
@@ -598,8 +603,8 @@ async function pollRunningJob(
     // SILENTLY: no failure toast (the entry is dismissed outright), no claim,
     // so the next boot's discovery slots the result in.
     console.warn('[ModelJobRecovery] poll deadline exceeded for job', job.id, '- giving up (next boot recovers)')
-    if (get(generationStates).get(genKey)?.generationId === registeredGenId) {
-        endGeneration(genKey)
+    if (generationOwnership) {
+        endGenerationIfOwned(genKey, generationOwnership)
     }
     if (statusId) {
         safeStatus(() => clearStatus(statusId))

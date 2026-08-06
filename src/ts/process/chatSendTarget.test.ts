@@ -1,7 +1,10 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import {
     applyChatInputToTarget,
+    captureChatPublicationGuard,
     captureChatSendTarget,
+    publishTriggerChatToTarget,
+    resolveChatExecutionTarget,
     resolveChatSendTarget,
     settleChatRerollToTarget,
 } from './chatSendTarget'
@@ -91,6 +94,54 @@ describe('chat send target', () => {
         ])
     })
 
+    test('queues destructive backup work only when the trigger snapshot is published to its durable target', async () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        const published = vi.fn()
+
+        await applyChatInputToTarget({
+            getDatabase: () => db,
+            target,
+            input: 'outer message',
+            runInputTrigger: async (_character, chat) => ({
+                chat: { ...structuredClone(chat), message: [] },
+                destructiveChatMutation: true,
+            }),
+            onDestructiveChatMutation: published,
+            processInput: async (_character, input) => input,
+        })
+
+        expect(published).toHaveBeenCalledOnce()
+        expect(published).toHaveBeenCalledWith({
+            chaId: 'character-a',
+            chatId: 'chat-a',
+        })
+    })
+
+    test('does not queue destructive backup work when the durable target disappears before publication', async () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        const published = vi.fn()
+
+        const result = await applyChatInputToTarget({
+            getDatabase: () => db,
+            target,
+            input: 'outer message',
+            runInputTrigger: async (_character, chat) => {
+                db.characters[0].chats.shift()
+                return {
+                    chat: { ...structuredClone(chat), message: [] },
+                    destructiveChatMutation: true,
+                }
+            },
+            onDestructiveChatMutation: published,
+            processInput: async (_character, input) => input,
+        })
+
+        expect(result).toBeNull()
+        expect(published).not.toHaveBeenCalled()
+    })
+
     test('resolves the target by durable IDs after character and chat reordering', () => {
         const db = makeDatabase()
         const target = captureChatSendTarget(db, 0)!
@@ -101,6 +152,90 @@ describe('chat send target', () => {
         expect(resolved?.characterIndex).toBe(1)
         expect(resolved?.chatIndex).toBe(1)
         expect(resolved?.chat.id).toBe('chat-a')
+    })
+
+    test('publishes a trigger result by durable IDs after reordering', () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        const triggeredChat = {
+            ...structuredClone(db.characters[0].chats[0]),
+            message: [{ role: 'char', data: 'triggered A' }],
+        }
+        db.characters.unshift({ chaId: 'other', chatPage: 0, chats: [] })
+        db.characters[1].chats.reverse()
+
+        const published = publishTriggerChatToTarget(db, target, { chat: triggeredChat })
+
+        expect(published?.characterIndex).toBe(1)
+        expect(published?.chatIndex).toBe(1)
+        expect(db.characters[1].chats[1].message).toEqual([
+            { role: 'char', data: 'triggered A' },
+        ])
+    })
+
+    test('resolves a fresh execution source after a same-ID row replacement', () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        const first = resolveChatExecutionTarget(db, target)!
+        const replacement = structuredClone(first.chat)
+        replacement.message.push({ role: 'char', data: 'new response' })
+        db.characters[0].chats[0] = replacement
+
+        const second = resolveChatExecutionTarget(db, target)!
+
+        expect(second.chat).toBe(replacement)
+        expect(second.chat).not.toBe(first.chat)
+        expect(second.chat.message.at(-1)?.data).toBe('new response')
+    })
+
+    test('rejects stale publication after the same-ID row is replaced during an await', () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        const sourceChat = db.characters[0].chats[0]
+        const guard = captureChatPublicationGuard(sourceChat)
+        const triggeredChat = structuredClone(sourceChat)
+        triggeredChat.message = []
+        const concurrentReplacement = structuredClone(sourceChat)
+        concurrentReplacement.message.push({ role: 'char', data: 'concurrent response' })
+        db.characters[0].chats[0] = concurrentReplacement
+        const backupReason = vi.fn()
+
+        const published = publishTriggerChatToTarget(
+            db,
+            target,
+            { chat: triggeredChat, destructiveChatMutation: true },
+            backupReason,
+            guard,
+        )
+
+        expect(published).toBeNull()
+        expect(db.characters[0].chats[0]).toBe(concurrentReplacement)
+        expect(db.characters[0].chats[0].message.at(-1)?.data).toBe('concurrent response')
+        expect(backupReason).not.toHaveBeenCalled()
+    })
+
+    test('rejects stale publication after in-place source state changes during an await', () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        const sourceChat = db.characters[0].chats[0]
+        const guard = captureChatPublicationGuard(sourceChat)
+        const triggeredChat = structuredClone(sourceChat)
+        triggeredChat.message = []
+        sourceChat.message.push({ role: 'char', data: 'concurrent response' })
+        const backupReason = vi.fn()
+
+        const published = publishTriggerChatToTarget(
+            db,
+            target,
+            { chat: triggeredChat, destructiveChatMutation: true },
+            backupReason,
+            guard,
+        )
+
+        expect(published).toBeNull()
+        expect(db.characters[0].chats[0]).toBe(sourceChat)
+        expect(sourceChat.message.at(-1)?.data).toBe('concurrent response')
+        expect(backupReason).not.toHaveBeenCalled()
     })
 
     test('restores a failed reroll to its originating chat after selection changes', () => {

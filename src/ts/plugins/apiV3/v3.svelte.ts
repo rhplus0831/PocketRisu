@@ -52,7 +52,6 @@ import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "s
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "src/ts/storage/abort";
 import { nativeConsoleWarn } from "src/ts/log-capture";
-import { endAllGenerations } from "src/ts/process/generationState";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import {
     getActiveChatSendTransaction,
@@ -1218,8 +1217,6 @@ export const makeRisuaiAPIV3 = (
             transaction: transaction ?? undefined,
             signal,
         }),
-        // The V3 path does not pass through the UI generation wrapper.
-        releaseGeneration: () => endAllGenerations(),
     });
     const databaseBridge = createPluginDatabaseBridge({
         allowedDbKeys,

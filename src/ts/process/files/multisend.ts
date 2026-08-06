@@ -1,28 +1,28 @@
-import { getDatabase, setDatabase } from 'src/ts/storage/database.svelte';
+import { getDatabase } from 'src/ts/storage/database.svelte';
 import { selectedCharID } from 'src/ts/stores.svelte';
 import { get } from 'svelte/store';
 import { sendChat } from '../index.svelte';
-import { endAllGenerations } from '../generationState';
+import { chatGenKey, isChatGenerating, runScopedGeneration } from '../generationState';
 import { downloadFile } from 'src/ts/globalApi.svelte';
 import { HypaProcesser } from '../memory/hypamemory';
 import { BufferToText as BufferToText, selectMultipleFile } from 'src/ts/util';
 import { postInlayAsset } from './inlays';
+import { captureChatSendTarget, resolveChatSendTarget } from '../chatSendTarget';
 
 type sendFileArg = {
     file:string
     query:string
 }
 
-async function sendPofile(arg:sendFileArg){
+export async function sendPofile(arg:sendFileArg){
 
     let result = ''
     let msgId = ''
     let note = ''
     let speaker = ''
     let parseMode = 0
-    const db = getDatabase()
-    let currentChar = db.characters[get(selectedCharID)]
-    let currentChat = currentChar.chats[currentChar.chatPage]
+    const target = captureChatSendTarget(getDatabase(), get(selectedCharID))
+    if(!target) return
     const lines = arg.file.split('\n')
     for(let i=0;i<lines.length;i++){
         console.log(i)
@@ -39,17 +39,26 @@ async function sendPofile(arg:sendFileArg){
             if(note !== ''){
                 text = `Note: ${note}\n${text}`
             }
+            const liveDatabase = getDatabase()
+            const resolvedTarget = resolveChatSendTarget(liveDatabase, target)
+            if(!resolvedTarget || resolvedTarget.chat._placeholder) return
+            const currentChat = resolvedTarget.chat
+            const generationKey = chatGenKey(target.chatId)
+            if(isChatGenerating(generationKey)){
+                throw new Error('A chat is already in progress')
+            }
             currentChat.message.push({
                 role: 'user',
                 data: text
             })
-            currentChar.chats[currentChar.chatPage] = currentChat
-            db.characters[get(selectedCharID)] = currentChar
-            endAllGenerations()
-            await sendChat(-1);
-            currentChar = db.characters[get(selectedCharID)]
-            currentChat = currentChar.chats[currentChar.chatPage]
-            const res = currentChat.message[currentChat.message.length-1]
+            resolvedTarget.character.chats[resolvedTarget.chatIndex] = currentChat
+            liveDatabase.characters[resolvedTarget.characterIndex] = resolvedTarget.character
+            await runScopedGeneration(generationKey, () =>
+                sendChat(-1, { target }));
+            const completedTarget = resolveChatSendTarget(getDatabase(), target)
+            if(!completedTarget || completedTarget.chat._placeholder) return
+            const res = completedTarget.chat.message[completedTarget.chat.message.length-1]
+            if(!res) return
             const msgStr = res.data.split('\n').filter((a) => {
                 return a !== ''
             }).map((str) => {

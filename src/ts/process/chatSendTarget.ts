@@ -1,4 +1,6 @@
 import type { Chat, Database, Message, character } from '../storage/database.svelte'
+import isEqual from 'lodash/isEqual'
+import { safeStructuredClone } from '../polyfill'
 
 export interface ChatSendTarget {
     chaId: string
@@ -12,6 +14,15 @@ export interface ResolvedChatSendTarget {
     chatIndex: number
 }
 
+export interface ChatExecutionTarget extends ChatSendTarget {
+    chat: Chat
+}
+
+export interface ChatPublicationGuard {
+    sourceChat: Chat
+    sourceSnapshot: Chat
+}
+
 export interface ChatRerollSettlement {
     originalMessages: Message[]
     trailingMessages: Message[]
@@ -21,9 +32,14 @@ export interface ChatRerollSettlement {
 type ChatTargetDatabase = Pick<Database, 'characters' | 'useSayNothing'>
 
 interface InputTriggerResult {
-    chat?: {
-        message?: Message[]
-    }
+    chat?: Chat
+    destructiveChatMutation?: boolean
+    chatPublicationGuard?: ChatPublicationGuard
+}
+
+interface TriggerChatPublicationResult {
+    chat?: Chat
+    destructiveChatMutation?: boolean
 }
 
 export function captureChatSendTarget(
@@ -52,6 +68,22 @@ export function resolveChatSendTarget(
     return { character, chat, characterIndex, chatIndex }
 }
 
+export function resolveChatExecutionTarget(
+    db: Pick<Database, 'characters'>,
+    target: ChatSendTarget,
+): ChatExecutionTarget | null {
+    const resolvedTarget = resolveChatSendTarget(db, target)
+    if (!resolvedTarget || resolvedTarget.chat._placeholder) return null
+    return { ...target, chat: resolvedTarget.chat }
+}
+
+export function captureChatPublicationGuard(chat: Chat): ChatPublicationGuard {
+    return {
+        sourceChat: chat,
+        sourceSnapshot: safeStructuredClone(chat),
+    }
+}
+
 export function isChatSendTargetActive(
     db: Pick<Database, 'characters'>,
     selectedCharacterIndex: number,
@@ -60,6 +92,36 @@ export function isChatSendTargetActive(
     const character = db.characters?.[selectedCharacterIndex]
     const chat = character?.chats?.[character.chatPage]
     return character?.chaId === target.chaId && chat?.id === target.chatId
+}
+
+/**
+ * Publish a trigger-produced chat to the durable target captured before the
+ * trigger awaited. Selection changes are irrelevant. With a publication
+ * guard, a removed/replaced target or any in-place source change is treated as
+ * stale and receives no publication or backup marker.
+ */
+export function publishTriggerChatToTarget(
+    db: Pick<Database, 'characters'>,
+    target: ChatSendTarget,
+    result: TriggerChatPublicationResult | null | undefined,
+    onDestructiveChatMutation?: (target: ChatSendTarget) => void,
+    guard?: ChatPublicationGuard,
+): ResolvedChatSendTarget | null {
+    if (!result?.chat || result.chat.id !== target.chatId) return null
+
+    const resolvedTarget = resolveChatSendTarget(db, target)
+    if (!resolvedTarget || resolvedTarget.chat._placeholder) return null
+    if (guard && (
+        resolvedTarget.chat !== guard.sourceChat
+        || !isEqual(resolvedTarget.chat, guard.sourceSnapshot)
+    )) return null
+
+    if (result.destructiveChatMutation === true) {
+        onDestructiveChatMutation?.(target)
+    }
+    resolvedTarget.character.chats[resolvedTarget.chatIndex] = result.chat
+
+    return { ...resolvedTarget, chat: result.chat }
 }
 
 export function findLastCharacterMessage(messages: Message[]): Message | null {
@@ -113,8 +175,17 @@ export async function applyChatInputToTarget(options: {
     input: string
     signal?: AbortSignal
     now?: () => number
-    runInputTrigger: (character: character, chat: Chat) => Promise<InputTriggerResult | null | undefined>
-    processInput: (character: character, input: string) => Promise<string>
+    runInputTrigger: (
+        character: character,
+        chat: Chat,
+        guard: ChatPublicationGuard,
+    ) => Promise<InputTriggerResult | null | undefined>
+    onDestructiveChatMutation?: (target: ChatSendTarget) => void
+    processInput: (
+        character: character,
+        input: string,
+        target: ResolvedChatSendTarget,
+    ) => Promise<string>
 }): Promise<ResolvedChatSendTarget | null> {
     const initialTarget = resolveChatSendTarget(options.getDatabase(), options.target)
     if (!initialTarget || initialTarget.chat._placeholder) return null
@@ -132,19 +203,35 @@ export async function applyChatInputToTarget(options: {
             }
         }
     } else if (initialTarget.character.type === 'character') {
-        const triggerResult = await options.runInputTrigger(initialTarget.character, initialTarget.chat)
+        const triggerPublicationGuard = captureChatPublicationGuard(initialTarget.chat)
+        const triggerResult = await options.runInputTrigger(
+            initialTarget.character,
+            initialTarget.chat,
+            triggerPublicationGuard,
+        )
         if (options.signal?.aborted) return null
         if (Array.isArray(triggerResult?.chat?.message)) {
             // Input triggers run before editinput handlers. Publish their
             // cloned chat result to the durable target before a handler can
             // start a child turn, so that turn builds on the trigger result
             // and cannot later be overwritten by the outer send.
-            const triggeredTarget = resolveChatSendTarget(options.getDatabase(), options.target)
-            if (!triggeredTarget || triggeredTarget.chat._placeholder) return null
-            triggeredTarget.chat.message = triggerResult.chat.message
+            const triggeredTarget = publishTriggerChatToTarget(
+                options.getDatabase(),
+                options.target,
+                triggerResult,
+                options.onDestructiveChatMutation,
+                triggerResult.chatPublicationGuard ?? triggerPublicationGuard,
+            )
+            if (!triggeredTarget) return null
         }
 
-        const processedInput = await options.processInput(initialTarget.character, options.input)
+        const processingTarget = resolveChatSendTarget(options.getDatabase(), options.target)
+        if (!processingTarget || processingTarget.chat._placeholder) return null
+        const processedInput = await options.processInput(
+            processingTarget.character,
+            options.input,
+            processingTarget,
+        )
         if (options.signal?.aborted) return null
         nextMessage = {
             role: 'user',

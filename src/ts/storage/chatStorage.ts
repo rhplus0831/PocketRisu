@@ -103,8 +103,20 @@ interface PendingChatBackupReason {
 
 const pendingChatBackupReasons = new Map<string, PendingChatBackupReason>()
 
+const requiredChatBackupReasons = new Set([
+    'reroll',
+    'delete-message',
+    'delete-swipe',
+    'script-bulk-chat',
+])
+
 export function setChatBackupReason(chaId: string, chatId: string, reason: string): void {
-    pendingChatBackupReasons.set(chatKey(chaId, chatId), { reason })
+    const key = chatKey(chaId, chatId)
+    const pending = pendingChatBackupReasons.get(key)
+    if (pending && requiredChatBackupReasons.has(pending.reason) && !requiredChatBackupReasons.has(reason)) {
+        return
+    }
+    pendingChatBackupReasons.set(key, { reason })
 }
 
 export function consumeChatBackupReason(chaId: string, chatId: string): string | undefined {

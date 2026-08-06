@@ -998,6 +998,29 @@ describe('NodeStorage availability bounds', () => {
         expect(cache.storeBytes).not.toHaveBeenCalled()
     })
 
+    it('propagates a destructive script reason on a full chat-row save', async () => {
+        const requests: RequestInit[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(init ?? {})
+            return new Response(JSON.stringify({ success: true, hash: 'a'.repeat(64) }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+            })
+        }))
+        const storage = readyStorage()
+
+        await storage.saveChatContent(
+            'character',
+            0,
+            'chat',
+            { message: [] },
+            'script-bulk-chat',
+        )
+
+        expect(new Headers(requests[0].headers).get('x-chat-backup-reason'))
+            .toBe('script-bulk-chat')
+    })
+
     it('uploads a delta only after an exact base acknowledgement and verifies its logical hash', async () => {
         cache.enabled = false
         const baseHash = 'a'.repeat(64)
@@ -1029,11 +1052,13 @@ describe('NodeStorage availability bounds', () => {
         const storage = readyStorage()
 
         await storage.saveChatContent('character', 0, 'chat', base)
-        await storage.saveChatContent('character', 0, 'chat', result)
+        await storage.saveChatContent('character', 0, 'chat', result, 'script-bulk-chat')
 
         expect(requests).toHaveLength(2)
         expect(new Headers(requests[1].headers).get('content-type'))
             .toBe('application/vnd.pocketrisu.chat-delta+json')
+        expect(new Headers(requests[1].headers).get('x-chat-backup-reason'))
+            .toBe('script-bulk-chat')
         expect(JSON.parse(requests[1].body as string)).toEqual({
             version: 1,
             baseHash,

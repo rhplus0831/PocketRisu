@@ -11,6 +11,7 @@ import { HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } from "../s
 import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
+import { authorizeImportedDestructiveAccess } from "./scriptCapabilities"
 
 export interface MCPModule{
     url: string
@@ -25,6 +26,7 @@ export interface RisuModule{
     trigger?: triggerscript[]
     id: string
     lowLevelAccess?: boolean
+    destructiveAccess?: boolean
     hideIcon?: boolean
     backgroundEmbedding?:string
     assets?:[string,string,string][]
@@ -32,6 +34,22 @@ export interface RisuModule{
     customModuleToggle?:string
     mcp?:MCPModule
     icon?:string
+}
+
+export async function confirmImportedModuleCapabilities(module:RisuModule):Promise<boolean> {
+    const requestsLowLevelAccess = module.lowLevelAccess === true
+    module.lowLevelAccess = false
+    if(requestsLowLevelAccess){
+        const conf = await alertConfirm(language.lowLevelAccessConfirm)
+        if(!conf){
+            return false
+        }
+        module.lowLevelAccess = true
+    }
+    return authorizeImportedDestructiveAccess(
+        module,
+        () => alertConfirm(language.destructiveAccessConfirm),
+    )
 }
 
 export async function exportModule(module:RisuModule, arg:{
@@ -285,6 +303,9 @@ export async function importModule(){
         try {
             const buf = Buffer.from(fileData)
             const module = await readModule(buf)
+            if(!await confirmImportedModuleCapabilities(module)){
+                return
+            }
             db.modules.push(module)
             notifySuccess(language.successImport)
         } catch (error) {
@@ -305,11 +326,8 @@ export async function importModule(){
             }
             importData.id = v4()
 
-            if(importData.lowLevelAccess){
-                const conf = await alertConfirm(language.lowLevelAccessConfirm)
-                if(!conf){
-                    return false
-                }
+            if(!await confirmImportedModuleCapabilities(importData)){
+                return false
             }
             db.modules.push(importData)
             notifySuccess(language.successImport)
@@ -475,7 +493,8 @@ export function getModuleTriggers() {
             // and would leak runtime-only fields (moduleId) into .risum exports.
             triggers = triggers.concat(module.trigger.map((t) => ({
                 ...t,
-                lowLevelAccess: module.lowLevelAccess,
+                lowLevelAccess: module.lowLevelAccess === true,
+                destructiveAccess: module.destructiveAccess === true,
                 moduleId: module.id,
             })))
         }

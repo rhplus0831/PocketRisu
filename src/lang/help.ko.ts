@@ -95,6 +95,7 @@ export const helpKo = {
         "customPromptTemplateToggle": "여기서 고유한 프롬프트 토글을 정의할 수 있습니다. 개행으로 구분하여 `<토글 변수>=<토글 이름>` 형식을 사용하세요. 예: `cot=COT 토글`. 프롬프트에서 `{{getglobalvar::toggle_<토글 변수>}}`를 사용하여 이 토글을 사용할 수 있습니다. 예: `{{getglobalvar::toggle_cot}}`.",
         "defaultVariables": "여기에서는 기본 변수를 정의할 수 있습니다. `<변수 이름>=<변수 값>` 형식으로 작성하고 개행으로 구분합니다. 예를 들어, `name=PocketRisu`는 트리거 스크립트 및 변수 CBS와 함께 `{{getvar::A}}`, `{{setvar::A::B}}` 또는 `{{? $A + 1}}`과 같이 사용할 수 있습니다. 프롬프트 템플릿의 기본 변수와 캐릭터의 기본 변수가 동일한 이름을 가진 경우 캐릭터의 기본 변수가 사용됩니다.",
         "lowLevelAccess": "활성화되면 높은 컴퓨팅 파워가 필요한 기능과 캐릭터 트리거를 통한 AI 모델 실행에 대한 접근이 허용됩니다. 꼭 필요한 경우가 아니면 활성화하지 마세요.",
+        "destructiveAccess": "캐릭터 또는 모듈 스크립트와 트리거 명령이 전체 채팅 기록을 자르거나 교체하고 로어북 항목을 삭제할 수 있게 합니다. 가져온 콘텐츠는 저수준 접근과 별도로 이 권한을 요청합니다.",
         "triggerLLMPrompt": "모델에 전송될 프롬프트입니다. `@@role user`, `@@role system`, `@@role assistant`를 사용하여 멀티 턴과 역할을 사용할 수 있습니다. 예:\n```\n@@role system\nrespond as hello\n@@role assistant\nhello\n@@role user\nhi\n```",
         "legacyTranslation": "활성화되면 번역 후 후처리 대신 번역 전 마크다운과 따옴표를 전처리하는 이전 번역 방식을 사용합니다.",
         "luaHelp": "Lua 스크립트를 트리거 스크립트로 사용할 수 있습니다. onInput, onOutput, onStart 함수를 정의할 수 있습니다. onInput은 사용자가 메시지를 보낼 때, onOutput은 캐릭터가 메시지를 보낼 때, onStart는 채팅이 시작될 때 호출됩니다. 자세한 내용은 문서를 참조하세요.",

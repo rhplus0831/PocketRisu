@@ -2305,6 +2305,7 @@ describe('chat backup capture', () => {
         expect(isDestructiveBackupReason('reroll')).toBe(true)
         expect(isDestructiveBackupReason(' DELETE MESSAGE!! ')).toBe(true)
         expect(isDestructiveBackupReason('Delete Swipe')).toBe(true)
+        expect(isDestructiveBackupReason('script-bulk-chat')).toBe(true)
         expect(isDestructiveBackupReason('edit-message')).toBe(false)
         expect(isDestructiveBackupReason('delete-chat')).toBe(false)
         expect(isDestructiveBackupReason(undefined)).toBe(false)

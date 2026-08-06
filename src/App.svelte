@@ -10,7 +10,7 @@
     import Settings from './lib/Setting/Settings.svelte';
     import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
     import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
-    import { readModule } from './ts/process/modules';
+    import { confirmImportedModuleCapabilities, readModule } from './ts/process/modules';
     import { notifySuccess } from './ts/alert';
     import { language } from './lang';
     import SavePopupIconComp from './lib/Others/SavePopupIcon.svelte';
@@ -90,6 +90,7 @@
     } else if (name.endsWith('.risum')) {
         const data = new Uint8Array(await file.arrayBuffer())
         const module = await readModule(Buffer.from(data))
+        if (!await confirmImportedModuleCapabilities(module)) return
         const db = getDatabase()
         db.modules.push(module)
         notifySuccess(language.successImport)

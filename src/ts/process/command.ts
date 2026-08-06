@@ -1,49 +1,147 @@
 import { get } from "svelte/store";
-import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentChat, setDatabase } from "../storage/database.svelte";
+import { getDatabase, setDatabase, type Chat, type character } from "../storage/database.svelte";
 import { selectedCharID } from "../stores.svelte";
 import { alertInput, alertMd, alertNormal, alertSelect } from "../alert";
 import { sayTTS } from "./tts";
 import { risuChatParser } from "../parser/parser.svelte";
 import { sendChat } from "./index.svelte";
-import { chatGenKey, endGeneration } from "./generationState";
+import {
+    captureGenerationOwnership,
+    chatGenKey,
+    endGenerationIfOwned,
+    isChatGenerating,
+} from "./generationState";
 import { loadLoreBookV3Prompt } from "./lorebook.svelte";
 import { runTrigger } from "./triggers";
+import { setChatBackupReason } from "../storage/chatStorage";
+import {
+    isDestructiveScriptCommand,
+    SCRIPT_BULK_CHAT_BACKUP_REASON,
+    splitScriptCommandPipeline,
+} from "./scriptCapabilities";
+import {
+    captureChatPublicationGuard,
+    publishTriggerChatToTarget,
+    resolveChatSendTarget,
+    type ChatPublicationGuard,
+    type ChatSendTarget,
+} from "./chatSendTarget";
+import { safeStructuredClone } from "../polyfill";
 
-export async function processMultiCommand(command:string) {
-    let pipe = ''
-    const splited:string[] = []
-    let lastIndex = 0
-    let quoteDepth = false
-    for(let i = 0; i<command.length; i++){
-        const char = command[i]
-        if(char === '"'){
-            quoteDepth = !quoteDepth
-        }
-        else if(char === '|' && quoteDepth === false){
-            splited.push(command.slice(lastIndex, i))
-            lastIndex = i+1
+export interface TriggerCommandContext {
+    target: ChatSendTarget
+    character: character
+    chat: Chat
+    destructiveAccess: boolean
+    chatPublicationGuard: ChatPublicationGuard
+}
+
+interface CommandExecutionState {
+    trigger?: TriggerCommandContext
+    destructiveChatMutation: boolean
+    targetMissing: boolean
+    chatPublicationGuard?: ChatPublicationGuard
+}
+
+export interface TriggerMultiCommandResult {
+    result: false | string
+    chat: Chat
+    destructiveChatMutation: boolean
+    targetMissing: boolean
+    chatPublicationGuard?: ChatPublicationGuard
+}
+
+async function sendNestedChat(
+    generationKey: string,
+    target?: ChatSendTarget,
+): Promise<boolean> {
+    if(isChatGenerating(generationKey)) return false
+
+    const pendingSend = sendChat(-1, target ? { target } : undefined)
+    // sendChat registers synchronously before its first await. Because this
+    // helper rejected a pre-existing entry above, the captured token belongs
+    // to this nested send (and follows its auto-continue/resend chain).
+    const ownership = captureGenerationOwnership(generationKey)
+    try {
+        return await pendingSend
+    } finally {
+        if(ownership){
+            endGenerationIfOwned(generationKey, ownership)
         }
     }
-    splited.push(command.slice(lastIndex))
+}
+
+export async function processMultiCommand(command:string) {
+    return (await processMultiCommandInternal(command, {
+        destructiveChatMutation: false,
+        targetMissing: false,
+    })).result
+}
+
+export async function processTriggerMultiCommand(
+    command: string,
+    context: TriggerCommandContext,
+): Promise<TriggerMultiCommandResult> {
+    const execution = await processMultiCommandInternal(command, {
+        trigger: context,
+        destructiveChatMutation: false,
+        targetMissing: false,
+        chatPublicationGuard: context.chatPublicationGuard,
+    })
+    return {
+        result: execution.result,
+        chat: execution.state.trigger!.chat,
+        destructiveChatMutation: execution.state.destructiveChatMutation,
+        targetMissing: execution.state.targetMissing,
+        chatPublicationGuard: execution.state.chatPublicationGuard,
+    }
+}
+
+async function processMultiCommandInternal(command:string, state:CommandExecutionState) {
+    let pipe = ''
+    const splited = splitScriptCommandPipeline(command)
     console.log(splited)
     for(let i = 0; i<splited.length; i++){
-        const result = await processCommand(splited[i].trim(), pipe)
+        const result = await processCommand(splited[i].trim(), pipe, state)
         console.log(pipe)
         if(result === false){
-            return false
+            return { result: false as const, state }
         }
         else{
             pipe = result
         }
     }
-    return pipe
+    return { result: pipe, state }
 }
 
 
-async function processCommand(command:string, pipe:string):Promise<false | string>{
+async function processCommand(
+    command:string,
+    pipe:string,
+    state:CommandExecutionState,
+):Promise<false | string>{
     const db = getDatabase()
-    const currentChar = db.characters[get(selectedCharID)]
-    const currentChat = currentChar.chats[currentChar.chatPage]
+    let currentChar: character
+    let currentChat: Chat
+    if(state.trigger){
+        const resolvedTarget = resolveChatSendTarget(db, state.trigger.target)
+        if(!resolvedTarget
+            || resolvedTarget.chat._placeholder
+            || state.trigger.character.chaId !== state.trigger.target.chaId
+            || state.trigger.chat.id !== state.trigger.target.chatId){
+            state.targetMissing = true
+            return false
+        }
+        currentChar = state.trigger.character
+        currentChat = state.trigger.chat
+    }
+    else{
+        currentChar = db.characters[get(selectedCharID)]
+        currentChat = currentChar?.chats?.[currentChar.chatPage]
+        if(!currentChar || !currentChat){
+            return false
+        }
+    }
     let {commandName, arg, namedArg} = commandParser(command, pipe)
 
     if(!arg){
@@ -59,6 +157,24 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
         namedArg[key] = risuChatParser(namedArg[key], {
             chara: currentChar.type === 'character' ? currentChar : null
         })
+    }
+
+    if(state.trigger
+        && isDestructiveScriptCommand(commandName, arg)
+        && state.trigger.destructiveAccess !== true){
+        return pipe
+    }
+
+    const commitOrdinaryMutation = () => {
+        if(!state.trigger){
+            setDatabase(db)
+        }
+    }
+
+    const markActualDestructiveMutation = (previousLength: number) => {
+        if(state.trigger && currentChat.message.length < previousLength){
+            state.destructiveChatMutation = true
+        }
     }
 
     switch(commandName){
@@ -102,7 +218,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 role: "user",
                 data: arg
             })
-            setDatabase(db)
+            commitOrdinaryMutation()
             return pipe
         }
         case 'sendas': {
@@ -111,40 +227,44 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 role: "char",
                 data: arg
             })
-            setDatabase(db)
+            commitOrdinaryMutation()
             return pipe
         }
         case 'comment': {
             //works differently, but its close enough
             const addition = `<Comment>\n${arg}\n</Comment>`
             currentChat.message[currentChat.message.length-1].data += addition
-            setDatabase(db)
+            commitOrdinaryMutation()
             return pipe
         }
         case 'cut':{
+            const previousLength = currentChat.message.length
             if(arg.includes('-')){
                 const [start, end] = arg.split('-')
                 currentChat.message = currentChat.message.slice(parseInt(start), parseInt(end))
-                setDatabase(db)
+                commitOrdinaryMutation()
             }
             else if(!isNaN(parseInt(arg))){
                 const index = parseInt(arg)
                 currentChat.message = currentChat.message.splice(index, 1)
-                setDatabase(db)
+                commitOrdinaryMutation()
             }
             else{ //For risu, doesn'ts work for STScript
                 const id = arg
                 currentChat.message = currentChat.message.filter((e)=>e.chatId !== id)
-                setDatabase(db)
+                commitOrdinaryMutation()
             }
+            markActualDestructiveMutation(previousLength)
             return pipe
         }
         case 'del': {
+            const previousLength = currentChat.message.length
             const size = parseInt(arg)
             if(!isNaN(size)){
                 currentChat.message = currentChat.message.slice(currentChat.message.length-size)
-                setDatabase(db)
+                commitOrdinaryMutation()
             }
+            markActualDestructiveMutation(previousLength)
             return pipe
         }
         case 'len':{
@@ -164,57 +284,88 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 splited.shift()
             }
             for(const e of splited){
+                const nestedGenerationKey = chatGenKey(
+                    state.trigger?.target.chatId ?? currentChat.id,
+                )
+                if(isChatGenerating(nestedGenerationKey)){
+                    return false
+                }
+                let clearedThisIteration = false
                 if(clearMode){
+                    clearedThisIteration = currentChat.message.length > 0
                     currentChat.message = []
+                    if(clearedThisIteration && state.trigger){
+                        state.destructiveChatMutation = true
+                    }
                 }
                 currentChat.message.push({
                     role: 'user',
                     data: e
                 })
-                await sendChat(-1)
-                // sendChat leaves its generation entry for the caller to release
-                // (DefaultChatScreen does the same after its own send). Without
-                // this the per-chat guard stays held and every later iteration
-                // returns immediately without sending.
-                endGeneration(chatGenKey(currentChat.id))
+                if(state.trigger){
+                    const publishedTarget = publishTriggerChatToTarget(
+                        getDatabase(),
+                        state.trigger.target,
+                        {
+                            chat: currentChat,
+                            destructiveChatMutation: clearedThisIteration,
+                        },
+                        ({ chaId, chatId }) => setChatBackupReason(
+                            chaId,
+                            chatId,
+                            SCRIPT_BULK_CHAT_BACKUP_REASON,
+                        ),
+                        state.chatPublicationGuard,
+                    )
+                    if(!publishedTarget){
+                        state.targetMissing = true
+                        return false
+                    }
+                    const sent = await sendNestedChat(
+                        nestedGenerationKey,
+                        state.trigger.target,
+                    )
+                    if(!sent) return false
+                    const refreshedTarget = resolveChatSendTarget(
+                        getDatabase(),
+                        state.trigger.target,
+                    )
+                    if(!refreshedTarget || refreshedTarget.chat._placeholder){
+                        state.targetMissing = true
+                        return false
+                    }
+                    currentChat = safeStructuredClone(refreshedTarget.chat)
+                    state.trigger.chat = currentChat
+                    state.chatPublicationGuard = captureChatPublicationGuard(
+                        refreshedTarget.chat,
+                    )
+                    state.trigger.chatPublicationGuard = state.chatPublicationGuard
+                    continue
+                }
+                const sent = await sendNestedChat(nestedGenerationKey)
+                if(!sent) return false
             }
             return ''
         }
         case 'setvar':{
             console.log(namedArg, arg)
-            const db = getDatabase()
-            const selectedChar = get(selectedCharID)
-            const char = db.characters[selectedChar]
-            const chat = char.chats[char.chatPage]
-            chat.scriptstate = chat.scriptstate ?? {}
-            chat.scriptstate['$' + namedArg['key']] = arg
-            console.log(chat.scriptstate)
-
-            char.chats[char.chatPage] = chat
-            db.characters[selectedChar] = char
-            setDatabase(db)
+            currentChat.scriptstate = currentChat.scriptstate ?? {}
+            currentChat.scriptstate['$' + namedArg['key']] = arg
+            console.log(currentChat.scriptstate)
+            commitOrdinaryMutation()
             return ''
         }
         case 'addvar':{
-            const db = getDatabase()
-            const selectedChar = get(selectedCharID)
-            const char = db.characters[selectedChar]
-            const chat = char.chats[char.chatPage]
-            chat.scriptstate = chat.scriptstate ?? {}
-            chat.scriptstate['$' + namedArg['key']] = (Number(chat.scriptstate['$' + namedArg['key']]) + Number(arg)).toString()
-
-            char.chats[char.chatPage] = chat
-            db.characters[selectedChar] = char
-            setDatabase(db)
+            currentChat.scriptstate = currentChat.scriptstate ?? {}
+            currentChat.scriptstate['$' + namedArg['key']] = (
+                Number(currentChat.scriptstate['$' + namedArg['key']]) + Number(arg)
+            ).toString()
+            commitOrdinaryMutation()
             return ''
         }
         case 'getvar':{
-            const db = getDatabase()
-            const selectedChar = get(selectedCharID)
-            const char = db.characters[selectedChar]
-            const chat = char.chats[char.chatPage]
-            chat.scriptstate = chat.scriptstate ?? {}
-            pipe = (chat.scriptstate['$' + namedArg['key']]).toString() ?? 'null'
+            currentChat.scriptstate = currentChat.scriptstate ?? {}
+            pipe = currentChat.scriptstate['$' + namedArg['key']]?.toString() ?? 'null'
             return pipe
         }
         case 'test_lorebook':{
@@ -224,16 +375,45 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
             return JSON.stringify(p)
         }
         case 'trigger':{
-            const currentChar = getCurrentCharacter()
+            if(!currentChar.chaId || !currentChat.id){
+                return pipe
+            }
+            const triggerTarget = state.trigger?.target ?? {
+                chaId: currentChar.chaId,
+                chatId: currentChat.id,
+            }
+            const initialGuard = state.trigger?.chatPublicationGuard
+                ?? captureChatPublicationGuard(currentChat)
             const triggerResult = await runTrigger(currentChar, 'manual', {
-                chat: getCurrentChat(),
-                manualName: arg
+                chat: currentChat,
+                manualName: arg,
+                chatPublicationGuard: initialGuard,
             });
 
             if(triggerResult){
-               setCurrentChat(triggerResult.chat);
+                if(state.trigger){
+                    state.trigger.chat = triggerResult.chat
+                    state.destructiveChatMutation ||= triggerResult.destructiveChatMutation === true
+                    state.chatPublicationGuard = triggerResult.chatPublicationGuard
+                        ?? initialGuard
+                    state.trigger.chatPublicationGuard = state.chatPublicationGuard
+                }
+                else{
+                    const publishedTarget = publishTriggerChatToTarget(
+                        getDatabase(),
+                        triggerTarget,
+                        triggerResult,
+                        ({ chaId, chatId }) => setChatBackupReason(
+                            chaId,
+                            chatId,
+                            SCRIPT_BULK_CHAT_BACKUP_REASON,
+                        ),
+                        triggerResult.chatPublicationGuard ?? initialGuard,
+                    )
+                    if(!publishedTarget) return false
+                }
             }
-            return
+            return pipe
         }
         case '?':{
             alertMd(`

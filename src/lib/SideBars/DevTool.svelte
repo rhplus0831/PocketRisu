@@ -15,7 +15,7 @@
     import { selectSingleFile } from "src/ts/util";
     import { doingChat, previewFormated, previewBody, sendChat, lastActualInputTokens } from "src/ts/process/index.svelte";
     import { chatOperationActive } from 'src/ts/process/chatSendState';
-    import { endAllGenerations } from "src/ts/process/generationState";
+    import { chatGenKey, isChatGenerating, runScopedGeneration } from "src/ts/process/generationState";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import { applyChatTemplate, chatTemplates } from "src/ts/process/templates/chatTemplate";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
@@ -32,10 +32,14 @@
             return false
         }
         alertWait("Loading...")
-        await sendChat(-1, {
+        const selectedCharacter = DBState.db.characters[$selectedCharID]
+        const generationKey = chatGenKey(
+            selectedCharacter?.chats?.[selectedCharacter.chatPage]?.id,
+        )
+        await runScopedGeneration(generationKey, () => sendChat(-1, {
             preview: previewJoin !== 'prompt',
             previewPrompt: previewJoin === 'prompt'
-        })
+        }))
 
         let md = ''
         const styledRole = {
@@ -48,7 +52,6 @@
         if(previewJoin === 'prompt'){
             md += '### Prompt\n'
             md += '```json\n' + JSON.stringify(JSON.parse(previewBody), null, 2).replaceAll('```', '\\`\\`\\`') + '\n```\n'
-            endAllGenerations()
             alertMd(md)
             return
         }
@@ -79,7 +82,6 @@
 
             md += '### Instruction\n'
             md += '```\n' + instructed.replaceAll('```', '\\`\\`\\`') + '\n```\n'
-            endAllGenerations()
             alertMd(md)
             return
         }
@@ -103,7 +105,6 @@
 
             md += '```\n' + formated[i].content.replaceAll('```', '\\`\\`\\`') + '\n```\n'
         }
-        endAllGenerations()
         alertMd(md)
     }
     
@@ -224,6 +225,8 @@
             const db = (DBState.db)
             let currentChar = db.characters[$selectedCharID]
             let currentChat = currentChar.chats[currentChar.chatPage]
+            const generationKey = chatGenKey(currentChat.id)
+            if(isChatGenerating(generationKey)) return
             currentChat.message.push({
                 role: 'user',
                 data: autopilot[i]
@@ -235,12 +238,10 @@
             }
             currentChar.chats[currentChar.chatPage] = currentChat
             db.characters[$selectedCharID] = currentChar
-            endAllGenerations()
-            await sendChat(i);
+            await runScopedGeneration(generationKey, () => sendChat(i));
             currentChar = db.characters[$selectedCharID]
             currentChat = currentChar.chats[currentChar.chatPage]
         }
-        endAllGenerations()
     }}>Run</Button>
 </Accordion>
 

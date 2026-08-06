@@ -11,6 +11,14 @@ import {
     resolveChatSendTarget,
 } from '../../process/chatSendTarget'
 import { createPluginChatSendController } from './pluginChatSend'
+import {
+    captureGenerationOwnership,
+    endAllGenerations,
+    endGenerationIfOwned,
+    generationStates,
+    isChatGenerating,
+    startGeneration,
+} from '../../process/generationState'
 
 function makeDatabase() {
     return {
@@ -31,6 +39,8 @@ afterEach(() => {
     const activeTransaction = getActiveChatSendTransaction()
     if (activeTransaction) finishChatSendTransaction(activeTransaction)
     doingChat.set(false)
+    generationStates.set(new Map())
+    endAllGenerations()
 })
 
 describe('V3 plugin child chat sends', () => {
@@ -38,24 +48,22 @@ describe('V3 plugin child chat sends', () => {
         const db = makeDatabase()
         const target = captureChatSendTarget(db, 0)!
         const transaction = beginChatSendTransaction(target)!
-        let generationActive = false
 
         const controller = createPluginChatSendController({
             getPermission: async () => true,
-            isGenerationActive: () => generationActive,
+            isGenerationActive: () => isChatGenerating(target.chatId),
             getActiveTransaction: getActiveChatSendTransaction,
             getDefaultTarget: () => captureChatSendTarget(db, 0)!,
             resolveTarget: candidate => resolveChatSendTarget(db, candidate),
             isPluginModelActive: () => false,
             runGeneration: async (candidate, activeTransaction) => {
                 expect(activeTransaction).toBe(transaction)
-                generationActive = true
+                startGeneration(candidate.chatId, 'plugin-child')
                 resolveChatSendTarget(db, candidate)!.chat.message.push({
                     role: 'char',
                     data: 'child response',
                 })
             },
-            releaseGeneration: () => { generationActive = false },
             now: () => 100,
         })
 
@@ -87,6 +95,7 @@ describe('V3 plugin child chat sends', () => {
         expect(db.characters[0].chats[1].message).toEqual([
             { role: 'char', data: 'history B' },
         ])
+        expect(isChatGenerating(target.chatId)).toBe(false)
     })
 
     test('an unrelated API call cannot borrow an active send transaction', async () => {
@@ -102,7 +111,6 @@ describe('V3 plugin child chat sends', () => {
             resolveTarget: candidate => resolveChatSendTarget(db, candidate),
             isPluginModelActive: () => false,
             runGeneration,
-            releaseGeneration: vi.fn(),
         })
 
         await expect(controller.sendChat('unrelated')).rejects.toThrow('already in progress')
@@ -122,7 +130,6 @@ describe('V3 plugin child chat sends', () => {
             resolveTarget: candidate => resolveChatSendTarget(db, candidate),
             isPluginModelActive: () => false,
             runGeneration: vi.fn(),
-            releaseGeneration: vi.fn(),
         })
         const inputHook = controller.wrapInputHook(async (content) => {
             await controller.sendChat('recursive')
@@ -139,7 +146,6 @@ describe('V3 plugin child chat sends', () => {
         const requestController = new AbortController()
         let permissionSignal: AbortSignal | undefined
         let generationSignal: AbortSignal | undefined
-        const releaseGeneration = vi.fn()
         const cancellation = new DOMException('Plugin sandbox terminated', 'AbortError')
         const controller = createPluginChatSendController({
             getPermission: async signal => {
@@ -152,12 +158,12 @@ describe('V3 plugin child chat sends', () => {
             resolveTarget: candidate => resolveChatSendTarget(db, candidate),
             isPluginModelActive: () => false,
             runGeneration: async (_candidate, _transaction, signal) => {
+                startGeneration(target.chatId, 'plugin-cancelled')
                 generationSignal = signal
                 return new Promise<never>((_resolve, reject) => {
                     signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })
                 })
             },
-            releaseGeneration,
         })
 
         const sending = controller.sendChat('pending', requestController.signal)
@@ -166,6 +172,41 @@ describe('V3 plugin child chat sends', () => {
 
         await expect(sending).rejects.toBe(cancellation)
         expect(permissionSignal).toBe(requestController.signal)
-        expect(releaseGeneration).toHaveBeenCalledOnce()
+        expect(isChatGenerating(target.chatId)).toBe(false)
+    })
+
+    test('preserves unrelated and same-key replacement owners when the plugin request settles', async () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        startGeneration('other-chat', 'other-live')
+        let settle!: () => void
+        let pluginOwnership: ReturnType<typeof captureGenerationOwnership>
+        const controller = createPluginChatSendController({
+            getPermission: async () => true,
+            // Production blocks another live send before this point. Keep this
+            // focused on scoped conclusion when another key already exists.
+            isGenerationActive: () => false,
+            getActiveTransaction: () => null,
+            getDefaultTarget: () => target,
+            resolveTarget: candidate => resolveChatSendTarget(db, candidate),
+            isPluginModelActive: () => false,
+            runGeneration: candidate => {
+                startGeneration(candidate.chatId, 'plugin-generation')
+                pluginOwnership = captureGenerationOwnership(candidate.chatId)
+                return new Promise<void>(resolve => {
+                    settle = resolve
+                })
+            },
+        })
+
+        const sending = controller.sendChat('plugin prompt')
+        await vi.waitFor(() => expect(pluginOwnership).toBeDefined())
+        endGenerationIfOwned(target.chatId, pluginOwnership!)
+        const replacement = startGeneration(target.chatId, 'replacement', 'background')
+        settle()
+
+        await expect(sending).resolves.toBe(true)
+        expect(captureGenerationOwnership(target.chatId)).toBe(replacement)
+        expect(isChatGenerating('other-chat')).toBe(true)
     })
 })

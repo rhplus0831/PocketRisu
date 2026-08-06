@@ -18,10 +18,19 @@ import { tokenize } from "../tokenizer";
 import { fetchNative, readImage } from "../globalApi.svelte";
 import { loadLoreBookV3Prompt } from './lorebook.svelte';
 import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
+import { SCRIPT_BULK_CHAT_BACKUP_REASON } from './scriptCapabilities';
+import { setChatBackupReason } from '../storage/chatStorage';
+import {
+    captureChatPublicationGuard,
+    publishTriggerChatToTarget,
+    type ChatExecutionTarget,
+} from './chatSendTarget';
+import { safeStructuredClone } from '../polyfill';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
 let ScriptingLowLevelIds = new Set<string>()
+let ScriptingDestructiveIds = new Set<string>()
 let lastRequestResetTime = 0
 let lastRequestsCount = 0
 
@@ -38,6 +47,8 @@ interface BasicScriptingEngineState {
      * the whole run is held under `mutex.runExclusive`.
      */
     moduleId?: string,
+    chatMutation?: boolean,
+    destructiveChatMutation?: boolean,
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -63,6 +74,7 @@ export async function runScripted(code:string, arg:{
     setVar?: (key:string, value:string) => void,
     getVar?: (key:string) => string,
     lowLevelAccess?: boolean,
+    destructiveAccess?: boolean,
     meta?: object,
     mode?: string,
     type?: 'lua'|'py',
@@ -78,7 +90,8 @@ export async function runScripted(code:string, arg:{
 
     let chat = arg.chat ?? getCurrentChat()
     let stopSending = false
-    let lowLevelAccess = arg.lowLevelAccess ?? false
+    let lowLevelAccess = arg.lowLevelAccess === true
+    let destructiveAccess = arg.destructiveAccess === true
 
     if(type === 'lua'){
         await ensureLuaFactory()
@@ -90,6 +103,8 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.chat = chat
         ScriptingEngineState.setVar = setVar
         ScriptingEngineState.getVar = getVar
+        ScriptingEngineState.chatMutation = false
+        ScriptingEngineState.destructiveChatMutation = false
         if (code !== ScriptingEngineState.code) {
             let declareAPI:(name: string, func:Function) => void
 
@@ -179,7 +194,11 @@ export async function runScripted(code:string, arg:{
                 }
                 const message = ScriptingEngineState.chat.message?.at(index)
                 if(message){
-                    message.data = value ?? ''
+                    const nextValue = value ?? ''
+                    if(message.data !== nextValue){
+                        message.data = nextValue
+                        ScriptingEngineState.chatMutation = true
+                    }
                 }
             })
             declareAPI('setChatRole', (id:string, index:number, value:string) => {
@@ -188,20 +207,37 @@ export async function runScripted(code:string, arg:{
                 }
                 const message = ScriptingEngineState.chat.message?.at(index)
                 if(message){
-                    message.role = value === 'user' ? 'user' : 'char'
+                    const nextRole = value === 'user' ? 'user' : 'char'
+                    if(message.role !== nextRole){
+                        message.role = nextRole
+                        ScriptingEngineState.chatMutation = true
+                    }
                 }
             })
             declareAPI('cutChat', (id:string, start:number, end:number) => {
-                if(!ScriptingSafeIds.has(id)){
+                if(!ScriptingSafeIds.has(id) || !ScriptingDestructiveIds.has(id)){
                     return
                 }
-                ScriptingEngineState.chat.message = ScriptingEngineState.chat.message.slice(start,end)
+                const previousMessages = ScriptingEngineState.chat.message
+                const nextMessages = previousMessages.slice(start,end)
+                const changed = nextMessages.length !== previousMessages.length
+                    || nextMessages.some((message, index) => message !== previousMessages[index])
+                if(changed){
+                    ScriptingEngineState.chat.message = nextMessages
+                    ScriptingEngineState.chatMutation = true
+                    ScriptingEngineState.destructiveChatMutation = true
+                }
             })
             declareAPI('removeChat', (id:string, index:number) => {
-                if(!ScriptingSafeIds.has(id)){
+                if(!ScriptingSafeIds.has(id) || !ScriptingDestructiveIds.has(id)){
+                    return
+                }
+                if(!ScriptingEngineState.chat.message.at(index)){
                     return
                 }
                 ScriptingEngineState.chat.message.splice(index, 1)
+                ScriptingEngineState.chatMutation = true
+                ScriptingEngineState.destructiveChatMutation = true
             })
             declareAPI('addChat', (id:string, role:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
@@ -209,6 +245,7 @@ export async function runScripted(code:string, arg:{
                 }
                 let roleData:'user'|'char' = role === 'user' ? 'user' : 'char'
                 ScriptingEngineState.chat.message.push({role: roleData, data: value ?? ''})
+                ScriptingEngineState.chatMutation = true
             })
             declareAPI('insertChat', (id:string, index:number, role:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
@@ -216,6 +253,7 @@ export async function runScripted(code:string, arg:{
                 }
                 let roleData:'user'|'char' = role === 'user' ? 'user' : 'char'
                 ScriptingEngineState.chat.message.splice(index, 0, {role: roleData, data: value ?? ''})
+                ScriptingEngineState.chatMutation = true
             })
 
             declareAPI('getTokens', async (id:string, value:string) => {
@@ -256,7 +294,7 @@ export async function runScripted(code:string, arg:{
             })
             
             declareAPI('setFullChatMain', (id:string, value:string) => {
-                if(!ScriptingSafeIds.has(id)){
+                if(!ScriptingSafeIds.has(id) || !ScriptingDestructiveIds.has(id)){
                     return
                 }
                 const realValue = JSON.parse(value)
@@ -267,6 +305,8 @@ export async function runScripted(code:string, arg:{
                         data: v.data
                     }
                 })
+                ScriptingEngineState.chatMutation = true
+                ScriptingEngineState.destructiveChatMutation = true
             })
 
             declareAPI('logMain', (value:string) => {
@@ -1047,6 +1087,9 @@ export async function runScripted(code:string, arg:{
             if(lowLevelAccess){
                 ScriptingLowLevelIds.add(accessKey)
             }
+            if(destructiveAccess){
+                ScriptingDestructiveIds.add(accessKey)
+            }
         }
         let res:any
         if(ScriptingEngineState.type === 'lua'){
@@ -1141,10 +1184,13 @@ export async function runScripted(code:string, arg:{
         }
         ScriptingSafeIds.delete(accessKey)
         ScriptingLowLevelIds.delete(accessKey)
+        ScriptingDestructiveIds.delete(accessKey)
         chat = ScriptingEngineState.chat
 
         return {
-            stopSending, chat, res
+            stopSending, chat, res,
+            chatMutation: Boolean(ScriptingEngineState.chatMutation),
+            destructiveChatMutation: Boolean(ScriptingEngineState.destructiveChatMutation),
         }
     })
 }
@@ -1373,7 +1419,15 @@ ${code}
 `
 }
 
-export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:character|simpleCharacterArgument, mode:string, content:T, meta?:object):Promise<T>{
+export type ScriptChatExecutionTarget = ChatExecutionTarget
+
+export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
+    char:character|simpleCharacterArgument,
+    mode:string,
+    content:T,
+    meta?:object,
+    target?:ScriptChatExecutionTarget,
+):Promise<T>{
     switch(mode){
         case 'editinput':
             mode = 'editInput'
@@ -1390,23 +1444,69 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
 
     try {
         let data = content
+        const currentCharacter = getCurrentCharacter()
+        const currentChat = getCurrentChat()
+        const capturedTarget = target ?? (
+            char.type !== 'simple'
+            && currentCharacter?.chaId === char.chaId
+            && currentChat?.id
+                ? { chaId: char.chaId, chatId: currentChat.id, chat: currentChat }
+                : undefined
+        )
+        const targetMatchesOwner = capturedTarget !== undefined
+            && char.type !== 'simple'
+            && capturedTarget.chaId === char.chaId
+            && capturedTarget.chatId === capturedTarget.chat?.id
+        let workingChat = capturedTarget?.chat
+            ? safeStructuredClone(capturedTarget.chat)
+            : currentChat
+                ? safeStructuredClone(currentChat)
+                : undefined
+        const publicationGuard = capturedTarget
+            ? captureChatPublicationGuard(capturedTarget.chat)
+            : undefined
+        let chatMutation = false
+        let destructiveChatMutation = false
 
-        const triggers = char.triggerscript.map((v) => {
-            v.lowLevelAccess = false
-            return v
-        }).concat(getModuleTriggers())
+        const triggers = char.triggerscript.map<triggerscript>((v) => ({
+            ...v,
+            lowLevelAccess: false,
+            destructiveAccess: targetMatchesOwner && char.destructiveAccess === true,
+        })).concat(getModuleTriggers())
     
         for(let trigger of triggers){
             if(trigger?.effect?.[0]?.type === 'triggerlua'){
                 const runResult = await runScripted(trigger.effect[0].code, {
                     char: char,
+                    chat: workingChat,
                     lowLevelAccess: false,
+                    destructiveAccess: targetMatchesOwner && trigger.destructiveAccess === true,
                     mode: mode,
                     data,
                     meta,
                 })
+                workingChat = runResult.chat ?? workingChat
+                chatMutation ||= runResult.chatMutation === true
+                destructiveChatMutation ||= runResult.destructiveChatMutation === true
                 data = runResult.res ?? data
             }
+        }
+
+        if(chatMutation && capturedTarget && workingChat){
+            publishTriggerChatToTarget(
+                getDatabase(),
+                capturedTarget,
+                {
+                    chat: workingChat,
+                    destructiveChatMutation,
+                },
+                ({ chaId, chatId }) => setChatBackupReason(
+                    chaId,
+                    chatId,
+                    SCRIPT_BULK_CHAT_BACKUP_REASON,
+                ),
+                publicationGuard,
+            )
         }
         
     
@@ -1416,29 +1516,83 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
     }
 }
 
-export async function runLuaButtonTrigger(char:character|simpleCharacterArgument, data:string):Promise<any>{
+export async function runLuaButtonTrigger(
+    char:character|simpleCharacterArgument,
+    data:string,
+    target?:ScriptChatExecutionTarget,
+):Promise<any>{
     let runResult
+    let chatMutation = false
+    let destructiveChatMutation = false
     try {
+        const currentCharacter = getCurrentCharacter()
+        const currentChat = getCurrentChat()
+        const capturedTarget = target ?? (
+            char.type !== 'simple'
+            && currentCharacter?.chaId === char.chaId
+            && currentChat?.id
+                ? { chaId: char.chaId, chatId: currentChat.id, chat: currentChat }
+                : undefined
+        )
+        const targetMatchesOwner = capturedTarget !== undefined
+            && char.type !== 'simple'
+            && capturedTarget.chaId === char.chaId
+            && capturedTarget.chatId === capturedTarget.chat?.id
+        let workingChat = capturedTarget?.chat
+            ? safeStructuredClone(capturedTarget.chat)
+            : currentChat
+                ? safeStructuredClone(currentChat)
+                : undefined
+        const publicationGuard = capturedTarget
+            ? captureChatPublicationGuard(capturedTarget.chat)
+            : undefined
         const triggers = char.triggerscript.map<triggerscript>((v) => ({
             ...v,
-            lowLevelAccess: char.type !== 'simple' ? char.lowLevelAccess ?? false : false
+            lowLevelAccess: char.type !== 'simple' && char.lowLevelAccess === true,
+            destructiveAccess: targetMatchesOwner && char.destructiveAccess === true,
         })).concat(getModuleTriggers())
 
         for(let trigger of triggers){
             if(trigger?.effect?.[0]?.type === 'triggerlua'){
                 runResult = await runScripted(trigger.effect[0].code, {
                     char: char,
+                    chat: workingChat,
                     lowLevelAccess: trigger.lowLevelAccess,
+                    destructiveAccess: targetMatchesOwner && trigger.destructiveAccess === true,
                     mode: 'onButtonClick',
                     data: data,
                     moduleId: trigger.moduleId,
                 })
+                workingChat = runResult.chat ?? workingChat
+                chatMutation ||= runResult.chatMutation === true
+                destructiveChatMutation ||= runResult.destructiveChatMutation === true
             }
+        }
+        if(chatMutation && capturedTarget && workingChat){
+            publishTriggerChatToTarget(
+                getDatabase(),
+                capturedTarget,
+                {
+                    chat: workingChat,
+                    destructiveChatMutation,
+                },
+                ({ chaId, chatId }) => setChatBackupReason(
+                    chaId,
+                    chatId,
+                    SCRIPT_BULK_CHAT_BACKUP_REASON,
+                ),
+                publicationGuard,
+            )
         }
     } catch (error) {
         throw(error)
     }
-    return runResult   
+    return runResult ? {
+        ...runResult,
+        chatMutation,
+        destructiveChatMutation,
+        chatPublicationHandled: true,
+    } : runResult
 }
 
 class PyodideContext{

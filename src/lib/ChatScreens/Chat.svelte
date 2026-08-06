@@ -17,8 +17,10 @@
     import { alertClear, alertConfirm, alertConfirmMulti, alertInput, alertRequestData, alertWait, notifyInfo, notifySuccess, type AlertAction } from "../../ts/alert"
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
-    import { getCurrentCharacter, getCurrentChat, setCurrentChat, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
+    import { getCurrentCharacter, getCurrentChat, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
     import { setChatBackupReason } from "../../ts/storage/chatStorage"
+    import { SCRIPT_BULK_CHAT_BACKUP_REASON } from "../../ts/process/scriptCapabilities"
+    import { captureChatPublicationGuard, isChatSendTargetActive, publishTriggerChatToTarget, resolveChatSendTarget } from "../../ts/process/chatSendTarget"
     import { selectedCharID } from "../../ts/stores.svelte"
     import { HideIconStore, ReloadGUIPointer, selIdState } from "../../ts/stores.svelte"
     import AutoresizeArea from "../UI/GUI/TextAreaResizable.svelte"
@@ -251,8 +253,13 @@
 
     async function handleButtonTriggerWithin(event: UIEvent) {
         const currentChar = getCurrentCharacter()
-        if(!currentChar){
+        const currentChat = getCurrentChat()
+        if(!currentChar?.chaId || !currentChat?.id){
             return
+        }
+        const triggerTarget = {
+            chaId: currentChar.chaId,
+            chatId: currentChat.id,
         }
 
         const target = event.target as HTMLElement
@@ -264,24 +271,48 @@
         const triggerName = origin.getAttribute('risu-trigger')
         const triggerId = origin.getAttribute('risu-id')
         const btnEvent = origin.getAttribute('risu-btn')
+        const triggerPublicationGuard = triggerName
+            ? captureChatPublicationGuard(currentChat)
+            : undefined
 
         const triggerResult =
             triggerName ?
                 await runTrigger(currentChar, 'manual', {
-                    chat: getCurrentChat(),
+                    chat: currentChat,
                     manualName: triggerName,
                     triggerId: triggerId || undefined,
+                    chatPublicationGuard: triggerPublicationGuard,
                 }) :
             btnEvent ?
-                await runLuaButtonTrigger(currentChar, btnEvent) :
+                await runLuaButtonTrigger(currentChar, btnEvent, {
+                    ...triggerTarget,
+                    chat: currentChat,
+                }) :
             null
 
         if(triggerResult) {
-            setCurrentChat(triggerResult.chat)
-            ReloadChatPointer.update((v) => {
-                v[idx] = (v[idx] ?? 0) + 1
-                return v
-            })
+            const handledTarget = triggerResult.chatPublicationHandled === true
+                ? resolveChatSendTarget(DBState.db, triggerTarget)
+                : null
+            const published = triggerResult.chatPublicationHandled === true
+                ? handledTarget?.chat._placeholder ? null : handledTarget
+                : publishTriggerChatToTarget(
+                    DBState.db,
+                    triggerTarget,
+                    triggerResult,
+                    ({ chaId, chatId }) => setChatBackupReason(
+                        chaId,
+                        chatId,
+                        SCRIPT_BULK_CHAT_BACKUP_REASON,
+                    ),
+                    triggerResult.chatPublicationGuard ?? triggerPublicationGuard,
+                )
+            if(published && isChatSendTargetActive(DBState.db, $selectedCharID, triggerTarget)){
+                ReloadChatPointer.update((v) => {
+                    v[idx] = (v[idx] ?? 0) + 1
+                    return v
+                })
+            }
         }
         
         if(triggerName && triggerId) {

@@ -14,7 +14,7 @@
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, sendChat } from "../../ts/process/index.svelte";
     import { ensureChatHydrated, setChatBackupReason } from "../../ts/storage/chatStorage";
-    import { abortGeneration, chatGenKey, endGeneration, generationStates, registerAbort } from "../../ts/process/generationState";
+    import { abortGeneration, captureGenerationOwnership, chatGenKey, concludeGenerationAttempt, generationStates, registerAbort } from "../../ts/process/generationState";
     import { claimPendingSend, clearPendingSend, markResumable, resumableSends, takeResumable } from "../../ts/process/request/pendingSends";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
@@ -45,6 +45,7 @@ import { isMobile } from 'src/ts/platform'
         settleChatRerollToTarget,
         type ChatSendTarget,
     } from 'src/ts/process/chatSendTarget';
+    import { SCRIPT_BULK_CHAT_BACKUP_REASON } from 'src/ts/process/scriptCapabilities';
     import {
         beginChatSendTransaction,
         chatOperationActive,
@@ -413,8 +414,25 @@ import { isMobile } from 'src/ts/platform'
                 target,
                 input: outgoingInput,
                 signal: inputAbortController.signal,
-                runInputTrigger: (character, chat) => runTrigger(character, 'input', { chat }),
-                processInput: (character, input) => processScript(character, input, 'editinput'),
+                runInputTrigger: (character, chat, chatPublicationGuard) => runTrigger(
+                    character,
+                    'input',
+                    { chat, chatPublicationGuard },
+                ),
+                onDestructiveChatMutation: ({ chaId, chatId }) => {
+                    setChatBackupReason(chaId, chatId, SCRIPT_BULK_CHAT_BACKUP_REASON)
+                },
+                processInput: (character, input, resolvedTarget) => processScript(
+                    character,
+                    input,
+                    'editinput',
+                    {},
+                    {
+                        chaId: target.chaId,
+                        chatId: target.chatId,
+                        chat: resolvedTarget.chat,
+                    },
+                ),
             })
             if(!appliedTarget) return
 
@@ -608,21 +626,30 @@ import { isMobile } from 'src/ts/platform'
         abortController = sendAbortController
         registerAbort(genKey, sendAbortController)
         let generated = false
+        const pendingSend = sendChat(-1, {
+            signal:sendAbortController.signal,
+            continue:continued,
+            target,
+            transaction,
+        })
+        // sendChat registers synchronously before its first await. Capture the
+        // exact owned chain so this UI conclusion cannot release a replacement
+        // that acquires the same key before the promise settles.
+        const generationOwnership = captureGenerationOwnership(genKey)
         try {
-            generated = await sendChat(-1, {
-                signal:sendAbortController.signal,
-                continue:continued,
-                target,
-                transaction,
-            })
+            generated = await pendingSend
         } catch (error) {
             console.error(error)
             alertError(error)
         } finally {
-            endGeneration(genKey)
-            // Send concluded on THIS client (success, failure or abort alike) —
-            // drop the resumable-send tombstone so no later boot re-runs it.
-            clearPendingSend(genKey)
+            if(concludeGenerationAttempt(
+                genKey,
+                generationOwnership,
+                sendAbortController,
+            )){
+                // This attempt, rather than a replacement owner, concluded.
+                clearPendingSend(genKey)
+            }
             if (abortController === sendAbortController) abortController = null
         }
         if(DBState.db.playMessage){
@@ -662,13 +689,21 @@ import { isMobile } from 'src/ts/platform'
         if (currentChatGenKey() !== chatId || $generationStates.has(chatId)) return
         const abortController = new AbortController()
         registerAbort(chatId, abortController)
+        const pendingSend = sendChat(-1, { signal: abortController.signal, target })
+        const generationOwnership = captureGenerationOwnership(chatId)
         try {
-            await sendChat(-1, { signal: abortController.signal, target })
+            await pendingSend
         } catch (error) {
             console.error(error)
+        } finally {
+            if(concludeGenerationAttempt(
+                chatId,
+                generationOwnership,
+                abortController,
+            )){
+                clearPendingSend(chatId)
+            }
         }
-        endGeneration(chatId)
-        clearPendingSend(chatId)
     }
 
     // One-shot via takeResumable; the timeout escapes the effect before the

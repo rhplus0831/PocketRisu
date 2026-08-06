@@ -336,7 +336,7 @@ describe('chat content row serving', () => {
       headers: {
         'content-type': CHAT_DELTA_CONTENT_TYPE,
         'x-chat-id': 'delta-chat',
-        'x-chat-backup-reason': 'streaming-checkpoint',
+        'x-chat-backup-reason': 'script-bulk-chat',
       },
       body: JSON.stringify({
         version: 1,
@@ -386,7 +386,7 @@ describe('chat content row serving', () => {
     }
     expect(history.versions).toHaveLength(1)
     expect(history.versions[0]).toMatchObject({
-      reason: 'streaming-checkpoint',
+      reason: 'script-bulk-chat',
       size: baseBytes.length,
     })
     const preImageResponse = await client.fetch(
@@ -696,11 +696,21 @@ describe('chat content row serving', () => {
       name: 'Second truncated state',
       message: [],
     }
+    const firstScriptCut = {
+      ...secondTruncated,
+      name: 'First script-cut state',
+    }
+    const secondScriptCut = {
+      ...secondTruncated,
+      name: 'Second script-cut state',
+    }
     const writes = [
       { value: initial },
       { value: preReroll, reason: 'edit-message' },
       { value: firstTruncated, reason: 'reroll' },
       { value: secondTruncated, reason: 'reroll' },
+      { value: firstScriptCut, reason: 'script-bulk-chat' },
+      { value: secondScriptCut, reason: 'script-bulk-chat' },
     ]
 
     for (const { value, reason } of writes) {
@@ -723,9 +733,13 @@ describe('chat content row serving', () => {
     const history = await historyResponse.json() as {
       versions: Array<{ versionId: string; reason: string; size: number }>
     }
-    expect(history.versions).toHaveLength(3)
+    expect(history.versions).toHaveLength(5)
     const destructiveVersions = history.versions.filter(version => version.reason === 'reroll')
     expect(destructiveVersions).toHaveLength(2)
+    const scriptVersions = history.versions.filter(
+      version => version.reason === 'script-bulk-chat',
+    )
+    expect(scriptVersions).toHaveLength(2)
 
     const recovered: unknown[] = []
     for (const version of destructiveVersions) {
@@ -737,10 +751,20 @@ describe('chat content row serving', () => {
     }
     expect(recovered).toContainEqual(preReroll)
     expect(recovered).toContainEqual(firstTruncated)
+    const recoveredScriptCuts: unknown[] = []
+    for (const version of scriptVersions) {
+      const response = await client.fetch(
+        `/api/chat-backups/destructive-pre-image-char/destructive-pre-image-chat/${version.versionId}`,
+      )
+      expect(response.status).toBe(200)
+      recoveredScriptCuts.push(decodeRisuDat(Buffer.from(await response.arrayBuffer())))
+    }
+    expect(recoveredScriptCuts).toContainEqual(secondTruncated)
+    expect(recoveredScriptCuts).toContainEqual(firstScriptCut)
     expect(rawKvRow(
       server.cwd,
       'chats/destructive-pre-image-char/destructive-pre-image-chat',
-    )).toEqual(encodeRisuDat(secondTruncated))
+    )).toEqual(encodeRisuDat(secondScriptCut))
   })
 
   test('ordinary overwrites remain subject to the pre-image cooldown', async () => {
@@ -845,6 +869,26 @@ describe('chat content row serving', () => {
       code: 'CHAT_PREIMAGE_CAPTURE_FAILED',
       error: expect.any(String),
       retryable: true,
+    })
+    expect(rawKvRow(server.cwd, rowKey)).toEqual(original)
+
+    const scriptDestructiveResponse = await client.fetch(
+      '/api/chat-content/pre-image-failure-char/0',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-chat-id': 'pre-image-failure-chat',
+          'x-chat-backup-reason': 'script-bulk-chat',
+        },
+        body: new Uint8Array(destructiveReplacement),
+      },
+    )
+    expect(scriptDestructiveResponse.status).toBe(500)
+    expect(await scriptDestructiveResponse.json()).toMatchObject({
+      code: 'CHAT_PREIMAGE_CAPTURE_FAILED',
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
     })
     expect(rawKvRow(server.cwd, rowKey)).toEqual(original)
 

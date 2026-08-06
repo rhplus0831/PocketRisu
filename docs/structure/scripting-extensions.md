@@ -334,9 +334,73 @@ Runtime event points are:
   It publishes the returned chat to the durable send target before awaiting the edit hook
   and eventually appending the user message (`src/ts/process/chatSendTarget.ts:124-168`).
 
-Character triggers inherit the character’s `lowLevelAccess`; cloned module triggers carry
-their owning module's flag and runtime-only `moduleId` (`src/ts/process/triggers.ts:1057`,
-`src/ts/process/modules.ts:467`). Display/request modes operate on temporary state and
+Outside display mode, `runTrigger()` owns one isolated chat clone for the whole trigger
+run. Message edits, author-note changes, `scriptstate` setters, and getter `outputVar`
+writes stay on that clone until the caller performs one guarded publication; they do not
+write through to the durable row while the trigger awaits. An intentional intermediate
+multisend publication refreshes the returned source guard after its child turn so final
+publication can distinguish that owned transition from external interference. Character
+description and lorebook side effects remain immediate compatibility actions, but resolve
+their owner by stable `chaId` and update only the affected owner field instead of replacing
+the selected character or its chat graph (`src/ts/process/triggers.ts`,
+`src/ts/process/command.ts`).
+
+The source guard is continuous across the entire trigger call graph. Input, manual,
+start, and both streaming and non-streaming output callers capture it before execution
+and publish with the returned guard (or that initial guard when no owned transition
+replaced it). V1/V2 recursive triggers and slash `/trigger` pass it into nested runs.
+Command pipelines receive the incoming guard; every intermediate multisend publication
+consumes it, and only a successful owned child turn refreshes it. A stale intermediate
+publication aborts the pipeline before the nested send or backup-reason callback. Display
+and request triggers do not use this durable guard because their allowed results remain
+temporary display/request state and are never published as a chat row
+(`src/ts/process/index.svelte.ts`, `src/lib/ChatScreens/Chat.svelte`,
+`src/lib/ChatScreens/DefaultChatScreen.svelte`, `src/ts/process/command.ts`).
+
+Trigger-targeted and ordinary multisend commands also respect per-chat generation
+ownership. A pre-existing generation rejects the nested send before message mutation,
+chat publication, or backup-reason queuing. Otherwise `sendChat()` registers its
+generation synchronously; the command captures that entry's opaque ownership token and
+conditionally releases only the entry still carrying that token in `finally`. Auto-
+continue/resend atomically exchanges the matching entry for a one-shot handoff carrying
+that token and its abort controller directly into the recursive call, even though the
+request generation ID changes. A replacement-owner mismatch prevents recursion, and a
+restart rejected before registration cancels the handoff instead of leaving ambient
+ownership or an abort controller for an unrelated later send.
+False/early rejection that acquired nothing performs no cleanup, and an entry installed
+by another owner after the nested send ended is preserved, so a start/output trigger
+cannot remove its outer send's guard or a same-key replacement
+(`src/ts/process/command.ts`, `src/ts/process/generationState.ts`).
+
+Direct request roots outside the main chat UI wrapper use the same exact-owner rule.
+V3 plugin child sends, hotkey prompt preview, DevTool preview and autopilot, and every PO
+file multisend iteration install a synchronous registration observer around their
+`sendChat()` call, capture the exact emitted token even if it is ended/replaced before the
+call returns, and conditionally conclude it in `finally`. This
+preserves other chats and same-key replacements on success, false, formatting errors, or
+request exceptions (including synchronous throws), and prevents the final batch iteration
+from leaking its entry. A PO batch also captures its initial character/chat IDs and
+re-resolves that durable owner before every iteration and after each send; navigation or
+downloads cannot redirect later entries into the newly selected character, and a missing
+or placeholder owner aborts the batch without mutating another row.
+`endAllGenerations()` is reserved for intentional global administrative reset; no
+production per-request root uses it (`src/ts/process/generationState.ts`,
+`src/ts/plugins/apiV3/pluginChatSend.ts`, `src/ts/hotkey.ts`,
+`src/lib/SideBars/DevTool.svelte`, `src/ts/process/files/multisend.ts`).
+
+Character triggers inherit the character’s separate `lowLevelAccess` and
+`destructiveAccess` capabilities; cloned module triggers carry their owning module's
+flags and runtime-only `moduleId` (`src/ts/process/triggers.ts`,
+`src/ts/process/modules.ts`). Card, module, and CharX imports inspect V1/V2 cuts, V2 lore
+deletion, Lua `cutChat`/`removeChat`/`setFullChat` APIs, and literal trigger-command
+pipelines containing `/cut`, `/del`, or `/multisend clear`; these require explicit
+destructive consent. Dynamically computed V1/V2 commands are reclassified and gated at
+execution. Trigger commands execute against the chat snapshot and durable character/chat
+IDs captured at trigger start, never the mutable UI selection. CharX also preserves an embedded module's declared request before
+clearing it for that consent decision, covering dynamically aliased Lua calls that a
+static scan cannot identify. Capability grants are recognized only when the owner value
+is the literal boolean `true`. That consent does not grant model, network, UI, or other
+low-level APIs. Display/request modes operate on temporary state and
 explicit allowlists, preventing most chat, network, UI, and model side effects
 (`src/ts/process/triggers.ts:1178`, `src/ts/process/triggers.ts:1308`).
 
@@ -344,12 +408,25 @@ explicit allowlists, preventing most chat, network, UI, and model side effects
 
 `runScripted()` reuses one engine per mode, recreating it only when source changes
 (`src/ts/process/scriptings.ts:78`, `src/ts/process/scriptings.ts:91`). It injects host
-functions, loads the wrapped Lua source, grants a per-run access key, and invokes the mode
-callback. Safe and low-level keys are removed after normal completion; edit-display keys
+functions, loads the wrapped Lua source, grants per-run safe, low-level, and destructive
+access keys, and invokes the mode callback. Safe, low-level, and destructive keys are
+removed after normal completion; edit-display keys
 are currently not removed from `ScriptingEditDisplayIds`
 (`src/ts/process/scriptings.ts:1041-1143`).
 
 Lua edit listeners register through `listenEdit(type, func)` and are called through `callListenMain` (`src/ts/process/scriptings.ts:1265`, `src/ts/process/scriptings.ts:1329`). Edit-display keys receive only the reduced display-safe capability set; low-level keys are granted only when the owning character/module permits them (`src/ts/process/scriptings.ts:1030`).
+
+Lua edit and button hooks execute chat-mutating host APIs against an isolated working
+clone rather than the durable chat object. After every awaited hook completes, a changed
+clone is published once to the character/chat IDs captured before execution. Repeated
+hooks resolve the current durable row for those IDs before each run. Publication also
+requires that the captured source object and its pre-run state are still current, so a
+same-ID replacement or in-place concurrent edit makes the hook result stale instead of
+overwriting newer messages; a missing target or unchanged clone is discarded. For destructive changes, the forced
+`script-bulk-chat` backup reason is queued synchronously immediately before that durable
+replacement, so the reactive save path cannot persist the replacement before its
+required pre-image reason exists (`src/ts/process/scriptings.ts`,
+`src/ts/process/chatSendTarget.ts`).
 
 Regular module trigger LLM actions, Lua effects, and Lua button callbacks propagate their
 runtime-only `moduleId`, so nested model calls can honor `Database.moduleModelBindings`.
@@ -511,7 +588,12 @@ non-preview ModelPreset requests are eligible (`src/ts/process/request/request.t
 
 - A Lua trigger whose first effect is `triggerlua` bypasses the ordinary event-type filter and is offered the current mode callback (`src/ts/process/triggers.ts:1206`). The Lua code decides which mode-named function exists.
 
-- Character low-level access is all-or-nothing for its triggers. Module trigger access follows `module.lowLevelAccess`; do not trust an arbitrary trigger’s stored `lowLevelAccess` independently of its owner.
+- Character low-level and destructive access are independent owner capabilities. Module
+  trigger access follows `module.lowLevelAccess` and `module.destructiveAccess`; do not
+  trust arbitrary stored per-trigger flags independently of their owner. V1/V2 cuts, V2
+  lore deletion, Lua whole-chat/removal APIs, and destructive trigger-command variants
+  must retain the destructive runtime gate. Command pipelines use `|`; `|||` remains the
+  multisend field delimiter and must not be split as a pipeline boundary.
 
 - Display and request trigger effects are allowlisted by effect type (`src/ts/process/triggers.ts:1301`). New V2 effects will silently do nothing in those modes unless explicitly added to the correct allowlist.
 
@@ -631,6 +713,11 @@ non-preview ModelPreset requests are eligible (`src/ts/process/request/request.t
 - To change Lua low-level access, audit key creation/removal at
   `src/ts/process/scriptings.ts:1041-1143` and every host API’s
   `ScriptingLowLevelIds` guard.
+
+- To change destructive script access, coordinate import scanning/consent in
+  `scriptCapabilities.ts`, owner propagation in characters/modules, runtime guards in
+  `triggers.ts` and `scriptings.ts`, and the publication-bound `script-bulk-chat` backup
+  reason.
 
 - To add a V2 trigger action, define its type near the existing V2 types, add it to
   `triggerEffectV2`, and implement its case in `runTrigger()`'s effect switch.

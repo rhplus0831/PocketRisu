@@ -1073,6 +1073,7 @@ export const languageEnglish = {
     customPromptTemplateToggle: "Custom Toggles",
     defaultVariables: "Default Variables",
     lowLevelAccess: "Low Level Access",
+    destructiveAccess: "Destructive Script Access",
     resultStoredVar: "Variable to Store Result",
     triggerEffRunLLM: "Run Main Model",
     triggerEffectSendAI: "Resend AI",
@@ -1086,6 +1087,8 @@ export const languageEnglish = {
     alertContent: "Alert Content",
     lowLevelAccessConfirm:
         "This content uses Low Level Access. which means this content can access the AI model and your storage directly. do you really want to import this content?",
+    destructiveAccessConfirm:
+        "This content contains scripts or trigger commands that can cut or replace chat history or delete lorebook entries. Grant Destructive Script Access and import it?",
     triggerLowLevelOnly: "This trigger only works with Low Level Access. to enable this trigger, enable Low Level Access in advanced settings in the character or module.",
     truthy: "Truthy",
     extractRegex: "Extract Text with Regex",

@@ -1,11 +1,11 @@
 import { parseChatML } from "../parser/chatML";
 import { risuChatParser } from "../parser/parser.svelte";
-import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type Chat, type character } from "../storage/database.svelte";
+import { getDatabase, type Chat, type character } from "../storage/database.svelte";
 import { tokenize } from "../tokenizer";
 import { getModuleTriggers } from "./modules";
 import { get } from "svelte/store";
-import { ReloadChatPointer, ReloadGUIPointer, selectedCharID, CurrentTriggerIdStore } from "../stores.svelte";
-import { processMultiCommand } from "./command";
+import { ReloadChatPointer, ReloadGUIPointer, CurrentTriggerIdStore } from "../stores.svelte";
+import { processTriggerMultiCommand } from "./command";
 import { parseKeyValue, sleep } from "../util";
 import { alertError, alertInput, alertNormal, alertSelect } from "../alert";
 import type { OpenAIChat } from "./index.svelte";
@@ -16,6 +16,11 @@ import { generateAIImage } from "./stableDiff";
 import { writeInlayImage } from "./files/inlays";
 import { runScripted } from "./scriptings";
 import { calcString } from "./infunctions";
+import {
+    captureChatPublicationGuard,
+    type ChatPublicationGuard,
+    type ChatSendTarget,
+} from "./chatSendTarget";
 
 
 export interface triggerscript{
@@ -24,6 +29,7 @@ export interface triggerscript{
     conditions: triggerCondition[]
     effect:triggerEffect[]
     lowLevelAccess?: boolean
+    destructiveAccess?: boolean
     /**
      * Runtime-only: set by getModuleTriggers() on the copy it hands out, so LLM
      * calls made by this trigger can be attributed to the module that shipped
@@ -1053,14 +1059,24 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     displayMode?: boolean
     displayData?: string
     tempVars?: Record<string, string>
+    chatPublicationGuard?: ChatPublicationGuard
 }){
+    const triggerTarget: ChatSendTarget | null = char.chaId && arg.chat?.id
+        ? { chaId: char.chaId, chatId: arg.chat.id }
+        : null
     arg.recursiveCount ??= 0
     char = arg.displayMode ? char : safeStructuredClone(char)
     let varChanged = false
     let stopSending = arg.stopSending ?? false
-    const CharacterlowLevelAccess = char.lowLevelAccess ?? false
+    const CharacterlowLevelAccess = char.lowLevelAccess === true
+    const characterDestructiveAccess = char.destructiveAccess === true
     let sendAIprompt = false
-    const currentChat = getCurrentChat()
+    let destructiveChatMutation = false
+    let chatPublicationGuard = arg.chatPublicationGuard ?? (
+        !arg.displayMode && triggerTarget
+            ? captureChatPublicationGuard(arg.chat)
+            : undefined
+    )
     let additonalSysPrompt:additonalSysPrompt = arg.additonalSysPrompt ?? {
         start:'',
         historyend: '',
@@ -1068,11 +1084,24 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     }
     const triggers = char.triggerscript.map((v) => {
         v.lowLevelAccess = CharacterlowLevelAccess
+        v.destructiveAccess = characterDestructiveAccess
         return v
     }).concat(getModuleTriggers())
     const db = getDatabase()
     const defaultVariables = parseKeyValue(char.defaultVariables).concat(parseKeyValue(db.templateDefaultVariables))
     let chat = arg.displayMode ? arg.chat : safeStructuredClone(arg.chat ?? char.chats[char.chatPage])
+    const updateOwnerCharacter = (update: (owner: character) => void) => {
+        if(arg.displayMode) return
+        const owner = getDatabase().characters.find(
+            candidate => candidate?.chaId === char.chaId,
+        )
+        if(owner) update(owner)
+    }
+    const publishOwnerLore = () => {
+        updateOwnerCharacter(owner => {
+            owner.globalLore = safeStructuredClone(char.globalLore ?? [])
+        })
+    }
     
     const previousTriggerId = get(CurrentTriggerIdStore)
     const shouldSetTriggerId = !arg.displayMode && mode !== 'display'
@@ -1195,15 +1224,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
             return
         }
         
-        const selectedCharId = get(selectedCharID)
-        const currentCharacter = getCurrentCharacter()
-        const db = getDatabase()
         varChanged = true
         chat.scriptstate ??= {}
         chat.scriptstate['$' + key] = value
-        currentChat.scriptstate = chat.scriptstate
-        currentCharacter.chats[currentCharacter.chatPage].scriptstate = chat.scriptstate
-        db.characters[selectedCharId].chats[currentCharacter.chatPage].scriptstate = chat.scriptstate
     }
     
     
@@ -1369,7 +1392,20 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'command':{
                     const effectValue = risuChatParser(effect.value,{chara:char})
-                    await processMultiCommand(effectValue)
+                    if(!triggerTarget){
+                        break
+                    }
+                    const commandResult = await processTriggerMultiCommand(effectValue, {
+                        target: triggerTarget,
+                        character: char,
+                        chat,
+                        destructiveAccess: trigger.destructiveAccess === true,
+                        chatPublicationGuard: chatPublicationGuard!,
+                    })
+                    chat = commandResult.chat
+                    destructiveChatMutation ||= commandResult.destructiveChatMutation
+                    chatPublicationGuard = commandResult.chatPublicationGuard
+                        ?? chatPublicationGuard
                     break
                 }
                 case 'stop':
@@ -1385,20 +1421,28 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             recursiveCount: arg.recursiveCount,
                             additonalSysPrompt,
                             stopSending,
-                            manualName: effect.value
+                            manualName: effect.value,
+                            chatPublicationGuard,
                         })
                         if(r){
                             additonalSysPrompt = r.additonalSysPrompt
                             chat = r.chat
                             stopSending = r.stopSending
+                            destructiveChatMutation ||= r.destructiveChatMutation
+                            chatPublicationGuard = r.chatPublicationGuard
+                                ?? chatPublicationGuard
                         }
                     }
                     break
                 }
                 case 'cutchat':{
+                    if(trigger.destructiveAccess !== true){
+                        break
+                    }
                     const start = Number(risuChatParser(effect.start,{chara:char}))
                     const end = Number(risuChatParser(effect.end,{chara:char}))
                     chat.message = chat.message.slice(start,end)
+                    destructiveChatMutation = true
                     break
                 }
                 case 'modifychat':{
@@ -1535,6 +1579,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'triggerlua':{
                     const triggerCodeResult = await runScripted(effect.code,{
                         lowLevelAccess: trigger.lowLevelAccess,
+                        destructiveAccess: trigger.destructiveAccess,
                         mode: mode === 'manual' ? arg.manualName : mode,
                         setVar: setVar,
                         getVar: getVar,
@@ -1547,6 +1592,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         stopSending = true
                     }
                     chat = triggerCodeResult.chat
+                    destructiveChatMutation ||= triggerCodeResult.destructiveChatMutation
                     break
                 }
 
@@ -1785,12 +1831,16 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             recursiveCount: arg.recursiveCount,
                             additonalSysPrompt,
                             stopSending,
-                            manualName: effect.target
+                            manualName: effect.target,
+                            chatPublicationGuard,
                         })
                         if(r){
                             additonalSysPrompt = r.additonalSysPrompt
                             chat = r.chat
                             stopSending = r.stopSending
+                            destructiveChatMutation ||= r.destructiveChatMutation
+                            chatPublicationGuard = r.chatPublicationGuard
+                                ?? chatPublicationGuard
                         }
                     }
                     break
@@ -1805,6 +1855,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     break
                 }
                 case 'v2CutChat':{
+                    if(trigger.destructiveAccess !== true){
+                        break
+                    }
                     let start = effect.startType === 'value' ? Number(risuChatParser(effect.start,{chara:char})) : Number(getVar(risuChatParser(effect.start,{chara:char})))
                     let end = effect.endType === 'value' ? Number(risuChatParser(effect.end,{chara:char})) : Number(getVar(risuChatParser(effect.end,{chara:char})))
                     if(isNaN(start)){
@@ -1815,6 +1868,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     }
                     
                     chat.message = chat.message.slice(start,end)
+                    destructiveChatMutation = true
                     break
                 }
                 case 'v2ModifyChat':{
@@ -1842,7 +1896,20 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 }
                 case 'v2Command':{
                     let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
-                    await processMultiCommand(value)
+                    if(!triggerTarget){
+                        break
+                    }
+                    const commandResult = await processTriggerMultiCommand(value, {
+                        target: triggerTarget,
+                        character: char,
+                        chat,
+                        destructiveAccess: trigger.destructiveAccess === true,
+                        chatPublicationGuard: chatPublicationGuard!,
+                    })
+                    chat = commandResult.chat
+                    destructiveChatMutation ||= commandResult.destructiveChatMutation
+                    chatPublicationGuard = commandResult.chatPublicationGuard
+                        ?? chatPublicationGuard
                     break
                 }
                 case 'v2SendAIprompt':{
@@ -1964,10 +2031,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         char.globalLore[index][1] = value
                     }
 
-                    const db = getDatabase()
-                    const selectedCharId = get(selectedCharID)
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(db.characters[selectedCharId])
+                    publishOwnerLore()
                     break
                 }
                 case 'v2GetLorebook':{
@@ -1997,10 +2061,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     let value = effect.value
                     char.globalLore[index][2] = value
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    publishOwnerLore()
 
                     break
                 }
@@ -2101,10 +2162,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'v2SetCharacterDesc':{
                     let value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     char.desc = value
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase();
-                    (db.characters[selectedCharId] as character).desc = value
-                    setCurrentCharacter(char)
+                    updateOwnerCharacter(owner => { owner.desc = value })
                     break
                 }
                 case 'v2GetPersonaDesc':{
@@ -2130,10 +2188,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'v2SetReplaceGlobalNote':{
                     const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     char.replaceGlobalNote = value
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase();
-                    (db.characters[selectedCharId] as character).replaceGlobalNote = value
-                    setCurrentCharacter(char)
+                    updateOwnerCharacter(owner => { owner.replaceGlobalNote = value })
                     break
                 }
                 case 'v2MakeArrayVar':{
@@ -2507,10 +2562,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         selective: false
                     })
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    publishOwnerLore()
                     break
                 }
                 case 'v2ModifyLorebookByIndex':{
@@ -2542,13 +2594,13 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         char.globalLore[index].insertorder = insertOrderNum
                     }
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    publishOwnerLore()
                     break
                 }
                 case 'v2DeleteLorebookByIndex':{
+                    if(trigger.destructiveAccess !== true){
+                        break
+                    }
                     char.globalLore = char.globalLore ?? []
                     let index = effect.indexType === 'value' ? Number(risuChatParser(effect.index,{chara:char})) : Number(getVar(risuChatParser(effect.index,{chara:char})))
                     
@@ -2558,10 +2610,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
 
                     char.globalLore.splice(index, 1)
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    publishOwnerLore()
                     break
                 }
                 case 'v2GetLorebookCountNew':{
@@ -2579,10 +2628,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
 
                     char.globalLore[index].alwaysActive = effect.value
 
-                    const selectedCharId = get(selectedCharID)
-                    const db = getDatabase()
-                    db.characters[selectedCharId].globalLore = char.globalLore
-                    setCurrentCharacter(char)
+                    publishOwnerLore()
                     break
                 }
                 case 'v2RegexTest':{
@@ -2605,15 +2651,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'v2SetAuthorNote':{
                     const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     chat.note = value
-                    
-                    if(!arg.displayMode){
-                        const selectedCharId = get(selectedCharID)
-                        const currentCharacter = getCurrentCharacter()
-                        const db = getDatabase()
-                        currentCharacter.chats[currentCharacter.chatPage].note = value
-                        db.characters[selectedCharId].chats[currentCharacter.chatPage].note = value
-                        setCurrentCharacter(currentCharacter)
-                    }
                     break
                 }
                 case 'v2MakeDictVar':{
@@ -2799,8 +2836,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         caculatedTokens += await tokenize(additonalSysPrompt.promptend)
     }
     if(varChanged){
-        const currentChat = getCurrentChat()
-        currentChat.scriptstate = chat.scriptstate
         ReloadGUIPointer.set(get(ReloadGUIPointer) + 1)
     }
 
@@ -2808,6 +2843,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         CurrentTriggerIdStore.set(previousTriggerId)
     }
     
-    return {additonalSysPrompt, chat, tokens:caculatedTokens, stopSending, sendAIprompt, displayData: arg.displayData, tempVars: arg.tempVars}
+    return {additonalSysPrompt, chat, tokens:caculatedTokens, stopSending, sendAIprompt, destructiveChatMutation, chatPublicationGuard, displayData: arg.displayData, tempVars: arg.tempVars}
 
 }

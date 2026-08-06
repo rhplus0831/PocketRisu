@@ -1174,6 +1174,7 @@ export const languageKorean = {
   customPromptTemplateToggle: "커스텀 토글",
   defaultVariables: "기본 변수",
   lowLevelAccess: "저수준 접근",
+  destructiveAccess: "파괴적 스크립트 접근",
   resultStoredVar: "결과 저장 변수",
   triggerEffRunLLM: "메인 모델 실행",
   triggerEffectSendAI: "AI 재전송",
@@ -1187,6 +1188,8 @@ export const languageKorean = {
   alertContent: "알림 내용",
   lowLevelAccessConfirm:
     "이 컨텐츠는 저수준 접근을 사용합니다. 이는 이 컨텐츠가 AI 모델과 당신의 저장소에 직접 접근할 수 있음을 의미합니다. 이 컨텐츠를 정말로 임포트하시겠습니까?",
+  destructiveAccessConfirm:
+    "이 콘텐츠에는 채팅 기록을 자르거나 교체하거나 로어북 항목을 삭제할 수 있는 스크립트 또는 트리거 명령이 포함되어 있습니다. 파괴적 스크립트 접근 권한을 부여하고 가져오시겠습니까?",
   triggerLowLevelOnly:
     "이 트리거는 저수준 접근만 사용할 수 있습니다. 이 트리거를 활성화하려면 캐릭터나 모듈의 고급 설정에서 저수준 접근을 활성화하세요.",
   truthy: "참",
