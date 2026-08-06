@@ -461,7 +461,16 @@ network call.
   `.inlay-publish-*` files. Same-extension payload replacement relies on atomic rename.
 - Safe-named `assets/*` values are filesystem-backed. Historical `assets/<content-hash>.<ext>` mismatches are tracked by private legacy-identity markers, while unsafe, non-portable (Windows-reserved or trailing-dot), and host-case-colliding names retain the SQLite fallback, so code must use the storage helpers instead of assuming one physical backend for every asset key.
 - The server still reads and migrates legacy SQLite `inlay/<id>` JSON records in
-  `migrateInlaysToFilesystem()`. Preserve this fallback when changing storage format.
+  `migrateInlaysToFilesystem()`. Every boot rechecks rows even if an older
+  `.migrated_to_fs` marker exists, and the marker is published only after no
+  legacy payload rows remain. A filesystem payload is finalized with a sidecar
+  before its KV shadow/info are removed; failed or unsafe rows remain available
+  for retry. Preserve this fallback when changing storage format.
+- Lossless full/server/main export plans a component-wise filesystem/KV inlay
+  union from one pinned cut. A resolved filesystem payload and matching readable
+  sidecar take precedence; legacy payload/info rows fill only missing components.
+  Unsafe legacy IDs fail lossless export because they cannot pass the archive
+  path contract. Upstream-target and partial exports intentionally omit inlays.
 - Direct asset URLs use one-year `immutable` caching. Reusing and overwriting an explicit
   inlay ID can leave a browser with a stale cached URL; new content normally needs a new
   ID.

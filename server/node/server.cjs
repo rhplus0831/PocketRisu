@@ -4922,19 +4922,40 @@ async function readInlayAssetPayload(id) {
 
 async function migrateInlaysToFilesystem() {
     await reconcileInterruptedInlayPublications();
-    if (existsSync(inlayMigrationMarker)) return;
-
     const keys = kvList('inlay/');
+    if (keys.length === 0) {
+        if (!existsSync(inlayMigrationMarker)) {
+            await fs.writeFile(inlayMigrationMarker, new Date().toISOString(), 'utf-8');
+        }
+        return;
+    }
+
     for (const key of keys) {
         const id = key.slice('inlay/'.length);
-        if (!isSafeInlayId(id)) continue;
+        if (!isSafeInlayId(id)) {
+            logger.warn(`[InlayFS] Cannot migrate unsafe legacy key ${JSON.stringify(key)}`);
+            continue;
+        }
         const fileAlreadyExists = await readInlayFile(id);
         if (fileAlreadyExists) {
-            kvDel(key);
-            kvDel(`inlay_thumb/${id}`);
-            kvDel(`inlay_info/${id}`);
-            kvClearDeletion(key);
-            continue;
+            try {
+                const sidecar = await readInlaySidecar(id);
+                if (!sidecar || normalizeInlayExt(sidecar.ext) !== fileAlreadyExists.ext) {
+                    const legacyInfo = await readInlayLegacyInfo(id);
+                    await writeInlaySidecar(id, {
+                        ...(legacyInfo || {}),
+                        ext: fileAlreadyExists.ext,
+                    });
+                }
+                kvDel(key);
+                kvDel(`inlay_thumb/${id}`);
+                kvDel(`inlay_info/${id}`);
+                kvClearDeletion(key);
+                continue;
+            } catch (error) {
+                logger.warn(`[InlayFS] Failed to finalize ${key}:`, error?.message || error);
+                continue;
+            }
         }
         const value = kvGet(key);
         if (!value) continue;
@@ -4965,7 +4986,13 @@ async function migrateInlaysToFilesystem() {
         }
     }
 
-    await fs.writeFile(inlayMigrationMarker, new Date().toISOString(), 'utf-8');
+    if (kvList('inlay/').length === 0) {
+        await fs.writeFile(inlayMigrationMarker, new Date().toISOString(), 'utf-8');
+    } else if (existsSync(inlayMigrationMarker)) {
+        await fs.unlink(inlayMigrationMarker).catch((error) => {
+            if (error?.code !== 'ENOENT') throw error;
+        });
+    }
 }
 
 function assetNameForKey(key) {
@@ -8696,6 +8723,16 @@ async function copyBackupExportFile(entry, destination, signal) {
     }
 }
 
+function unsafeLegacyInlayBackupError(key) {
+    const error = new Error(
+        `Backup cannot safely archive legacy inlay key ${JSON.stringify(key)}; `
+        + 'migrate or remove the invalid inlay before retrying',
+    );
+    error.code = 'BACKUP_UNSAFE_LEGACY_INLAY';
+    error.statusCode = 409;
+    return error;
+}
+
 async function planFullBackupFilesystemEntries(snapshot, target) {
     const entries = [];
     for (const asset of listAssetEntriesWithSizes(snapshot)) {
@@ -8727,30 +8764,70 @@ async function planFullBackupFilesystemEntries(snapshot, target) {
     // The PocketRisu main rollback target can, so retain them there.
     if (target === 'upstream') return entries;
 
-    for (const inlay of await listInlayFiles()) {
-        const sourceStat = await fs.stat(inlay.filePath);
+    const physicalInlayIds = new Set(
+        (await listInlayFiles()).map((inlay) => inlay.id),
+    );
+    const filesystemPayloadIds = new Set();
+    const filesystemSidecarIds = new Set();
+    for (const id of [...physicalInlayIds].sort((a, b) => a.localeCompare(b))) {
+        const sourcePath = await resolveInlayFilePath(id);
+        if (!sourcePath) continue;
+        const ext = normalizeInlayExt(path.extname(sourcePath).slice(1));
+        const sourceStat = await fs.stat(sourcePath);
         entries.push({
             kind: 'source-file',
-            sourcePath: inlay.filePath,
+            sourcePath,
             sourceStat,
-            backupName: `inlay/${inlay.id}.${inlay.ext}`,
-            sortKey: `inlay/${inlay.id}`,
+            backupName: `inlay/${id}.${ext}`,
+            sortKey: `inlay/${id}`,
             size: sourceStat.size,
         });
-        const sidecarPath = getInlaySidecarPath(inlay.id);
+        filesystemPayloadIds.add(id);
+
+        const sidecar = await readInlaySidecar(id);
+        if (!sidecar || normalizeInlayExt(sidecar.ext) !== ext) continue;
+        const sidecarPath = getInlaySidecarPath(id);
         try {
             const sidecarStat = await fs.stat(sidecarPath);
             entries.push({
                 kind: 'source-file',
                 sourcePath: sidecarPath,
                 sourceStat: sidecarStat,
-                backupName: `inlay_sidecar/${inlay.id}`,
-                sortKey: `inlay_sidecar/${inlay.id}`,
+                backupName: `inlay_sidecar/${id}`,
+                sortKey: `inlay_sidecar/${id}`,
                 size: sidecarStat.size,
             });
+            filesystemSidecarIds.add(id);
         } catch (error) {
             if (error?.code !== 'ENOENT') throw error;
         }
+    }
+
+    const restorableInlayIds = new Set(filesystemPayloadIds);
+    for (const row of snapshot.kvListWithSizes('inlay/')) {
+        const id = row.key.slice('inlay/'.length);
+        if (!isSafeInlayId(id)) throw unsafeLegacyInlayBackupError(row.key);
+        restorableInlayIds.add(id);
+        if (filesystemPayloadIds.has(id)) continue;
+        entries.push({
+            kind: 'kv-source',
+            key: row.key,
+            backupName: row.key,
+            sortKey: row.key,
+            size: row.size,
+        });
+    }
+    for (const row of snapshot.kvListWithSizes('inlay_info/')) {
+        const id = row.key.slice('inlay_info/'.length);
+        if (!restorableInlayIds.has(id) || filesystemSidecarIds.has(id)) continue;
+        if (!isSafeInlayId(id)) throw unsafeLegacyInlayBackupError(row.key);
+        entries.push({
+            kind: 'kv-source',
+            key: row.key,
+            backupName: row.key,
+            sortKey: row.key,
+            size: row.size,
+        });
     }
     return entries;
 }

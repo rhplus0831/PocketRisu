@@ -50,7 +50,9 @@ The exported application graph spans:
 - `remotes/*` source rows referenced by block-format databases, folded into the portable
   `database.risudat` rather than emitted as independent archive entries;
 - safe ordinary assets under `save/assets/`;
-- inlay payloads and sidecars under `save/inlays/`.
+- inlay payloads and sidecars under `save/inlays/`, with safe legacy
+  `inlay/<id>` and `inlay_info/<id>` snapshot rows filling any component that
+  has no verified filesystem source.
 
 `server/node/backupEntryFormat.cjs` defines entry header framing and bounds.
 `server/node/streamBackupRisuSave.cjs` rewrites seekable RisuSave sources without
@@ -80,6 +82,15 @@ Full download and server-file export share a strict point-in-time protocol:
 6. Assemble and stream only from the pinned SQLite and filesystem sources.
 7. Release readers, reservations, and private files in `finally`, including disconnect
    and sink-failure paths.
+
+Inlay selection is component-wise at that cut. One resolved filesystem payload
+and its matching readable sidecar win for a safe ID; pinned legacy payload or
+info rows are emitted only when the corresponding filesystem component is
+missing. This preserves post-marker save-folder imports and failed migration
+rows without duplicating stale KV shadows. A readable legacy payload whose ID
+cannot pass the existing archive/path validation rejects lossless full and
+server-file export with `BACKUP_UNSAFE_LEGACY_INLAY`. Upstream-target and
+partial exports keep their intentional inlay omission.
 
 Missing referenced chat rows fail full and server-file exports with
 `BACKUP_MISSING_CHAT_ROW`. This fail-closed policy is different from partial jobs and

@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **29 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **28 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -14,7 +14,6 @@ Current catalog: **29 open**, **0 deferred**, and **5 accepted decisions**.
 | ID | Finding | Status | Source |
 |---|---|---|---|
 | `FND-chat-version-import-acknowledges-before-save` | [Chat-version import reports success before anything is persisted](open/backup-recovery/chat-version-import-acknowledges-before-save.md) | Open | 2026-07 data-loss audit |
-| `FND-unmigrated-kv-inlays-are-omitted-from-backups` | [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) | Open | 2026-07 data-loss audit |
 | `FND-server-backup-published-without-fsync` | [Server backups are acknowledged before the directory entry is durable](open/backup-recovery/server-backup-published-without-fsync.md) | Open | 2026-07 data-loss audit |
 | `FND-upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references` | [Upstream-compatible backup drops live inlays but keeps their chat references](open/backup-recovery/upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references.md) | Open | 2026-07 data-loss audit |
 
